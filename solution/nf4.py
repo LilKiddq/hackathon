@@ -91,7 +91,7 @@ def dequantize_nf4(packed, quant_state, dtype=torch.float16):
         flat, quant_state.absmax, state2.code, state2.absmax, offset.float().reshape(1),
         _table(packed.device), out, n_bytes, n_out,
         HALF_BLOCK=quant_state.blocksize // 2, GROUP2=state2.blocksize, BLOCK_BYTES=BLOCK_BYTES,
-        EXACT=packed.is_cuda, num_warps=4)
+        EXACT=packed.is_cuda, num_warps=4, enable_fp_fusion=False)
     return out
 
 
