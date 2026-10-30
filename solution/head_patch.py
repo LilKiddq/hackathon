@@ -199,19 +199,36 @@ def _fp16_tied_embedding(model):
     embed.register_forward_hook(lambda module, args, output: output.float())
 
 
-def _start_pinning(model, cfg=None, tcfg=None, *_):
-    """Pin the offload arena (offload.py) in the background while Soup builds the trainer."""
-    lm = _causal_lm(model)
+def _start_pinning(cfg=None, tcfg=None, *_):
+    """Pin the offload arena (offload.py) in the background while Soup loads the model.
+
+    Pinning ~2 GB of host memory takes seconds; started here it overlaps the model loading that
+    follows. The arena's size comes from the checkpoint's config.json in the local Hugging Face
+    cache (a file read, nothing is loaded), the batch size and the max length. Without a cached
+    config nothing starts, and the first training step reserves the arena itself."""
     try:
+        import json
+
+        from huggingface_hub import try_to_load_from_cache
+
+        if not torch.cuda.is_available() or not isinstance(cfg.base, str):
+            return
+        path = try_to_load_from_cache(cfg.base, "config.json")
+        if not isinstance(path, str):
+            return
+        with open(path, encoding="utf-8") as handle:
+            config = types.SimpleNamespace(**json.load(handle))
         max_tokens = int(tcfg.batch_size) * int(cfg.data.max_length)
-    except Exception:  # noqa: BLE001 - unknown config: the first step reserves it instead
+        nbytes = offload.arena_bytes(config, max_tokens)
+        if isinstance(nbytes, int) and nbytes > 0:
+            offload.OFFLOADER.reserve_in_background(nbytes)
+    except Exception:  # noqa: BLE001 - only a head start; training never depends on it
         return
-    if lm is not None and lm.lm_head.weight.is_cuda:
-        offload.OFFLOADER.reserve_in_background(offload.arena_bytes(lm.config, max_tokens))
 
 
 def patch_soup_setup():
-    """Runs `_fp16_tied_embedding` when Soup has built the final 4-bit PEFT model."""
+    """Starts pinning the offload arena before Soup loads the model, and runs
+    `_fp16_tied_embedding` when Soup has built the final 4-bit PEFT model."""
     from soup_cli.trainer import sft
 
     cls = sft.SFTTrainerWrapper
@@ -220,11 +237,11 @@ def patch_soup_setup():
     original = cls._setup_transformers
 
     def _setup_transformers(self, *args, **kwargs):
+        _start_pinning(*args)
         result = original(self, *args, **kwargs)
         model = getattr(self, "model", None)
         if isinstance(model, torch.nn.Module):
             _fp16_tied_embedding(model)
-            _start_pinning(model, *args)
         return result
 
     _setup_transformers._kc_patched = True

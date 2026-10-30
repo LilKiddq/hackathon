@@ -15,6 +15,7 @@ SwiGLU itself is still the example's kernel (it does not count as ours); only wh
 its backward pass, and where, is ours.
 """
 
+import atexit
 import threading
 
 import torch
@@ -47,11 +48,13 @@ class Offloader:
             self.arena = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
 
     def reserve_in_background(self, nbytes):
-        """Pin the host memory while Soup builds the trainer (pinning ~2 GB takes a while)."""
+        """Pin the host memory in the background (pinning ~2 GB takes seconds)."""
         if self._reserving is None and torch.cuda.is_available():
             self._reserving = threading.Thread(target=self._reserve_quietly, args=(nbytes,),
                                                name="offload-pinning", daemon=True)
             self._reserving.start()
+            # a process that ends before training (the regression tests) lets it finish first
+            atexit.register(self._reserving.join, 120)
 
     def _reserve_quietly(self, nbytes):
         try:
