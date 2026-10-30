@@ -10,12 +10,14 @@ properties Triton specializes on (divisibility by 16), so the real launches find
 kernels. `wait()` runs before the first training step.
 """
 
+import atexit
 import threading
 import types
 
 import torch
 
 _thread = None
+TIMEOUT_S = 120  # the warm-up takes ~10 s; past this the kernels just compile on first use
 
 
 def _compile_all():
@@ -78,15 +80,17 @@ def start():
     """Start the background compilation once, when there is a GPU."""
     global _thread
     if _thread is None and torch.cuda.is_available():
-        # not a daemon: a process that ends early (the regression tests) waits for it
-        _thread = threading.Thread(target=_run, name="kernel-warmup")
+        # A daemon, so it can never keep a finished process alive; a process that ends early
+        # (the regression tests) still lets it finish, for at most TIMEOUT_S, at exit.
+        _thread = threading.Thread(target=_run, name="kernel-warmup", daemon=True)
         _thread.start()
+        atexit.register(_thread.join, TIMEOUT_S)
 
 
 def wait():
     global _thread
     if _thread is not None:
-        _thread.join()
+        _thread.join(TIMEOUT_S)
         _thread = None
         # the warm-up's small blocks would otherwise stay cached next to the training's (~18 MiB)
         torch.cuda.empty_cache()
