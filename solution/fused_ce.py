@@ -28,9 +28,12 @@ NEG = -1.0e30  # finite "minus infinity": keeps exp(a - b) free of inf - inf
 
 
 @triton.jit
-def lm_head_ce_stats_kernel(logits_ptr, stride, target_ptr, lse_ptr, loss_ptr, entropy_ptr,
-                            hit_ptr, V, BLOCK_V: tl.constexpr, NEG: tl.constexpr):
-    """One program per token row: log-sum-exp, entropy, argmax and the label's loss in one read.
+def lm_head_ce_kernel(logits_ptr, stride, target_ptr, coef_ptr, lse_ptr, loss_ptr, entropy_ptr,
+                      hit_ptr, V, WITH_GRAD: tl.constexpr, BLOCK_V: tl.constexpr,
+                      NEG: tl.constexpr):
+    """One program per token row. First pass: log-sum-exp, entropy, argmax and the label's loss
+    in one read. Second pass, for a labelled row when a gradient is wanted: the row is turned in
+    place into coef * (softmax(row) - onehot(target)), in the logits' dtype.
 
     Every lane keeps its own running max m, sum of exp(x - m) and sum of exp(x - m) * x, plus its
     own best value and index; the lanes are merged once at the end."""
@@ -80,24 +83,16 @@ def lm_head_ce_stats_kernel(logits_ptr, stride, target_ptr, lse_ptr, loss_ptr, e
     tl.store(entropy_ptr + row, entropy)
     tl.store(hit_ptr + row, hit.to(tl.int32))
 
-
-@triton.jit
-def lm_head_ce_grad_kernel(logits_ptr, stride, target_ptr, lse_ptr, scale_ptr, V,
-                           BLOCK_V: tl.constexpr):
-    """In place: logits row -> scale * (softmax(row) - onehot(target)), in the logits' dtype."""
-    row = tl.program_id(0).to(tl.int64)
-    row_ptr = logits_ptr + row * stride
-    target = tl.load(target_ptr + row)
-    lse = tl.load(lse_ptr + row)
-    scale = tl.load(scale_ptr)
-    lanes = tl.arange(0, BLOCK_V)
-    for start in range(0, V, BLOCK_V):
-        cols = start + lanes
-        valid = cols < V
-        x = tl.load(row_ptr + cols, mask=valid, other=0.0).to(tl.float32)
-        grad = tl.exp(x - lse) - tl.where(cols == target, 1.0, 0.0)
-        tl.store(row_ptr + cols, (grad * scale).to(logits_ptr.dtype.element_ty), mask=valid)
-
+    if WITH_GRAD:
+        if labelled:
+            coef = tl.load(coef_ptr)
+            for start in range(0, V, BLOCK_V):
+                cols = start + lanes
+                valid = cols < V
+                x = tl.load(row_ptr + cols, mask=valid, other=0.0).to(tl.float32)
+                grad = tl.exp(x - lse) - tl.where(cols == target, 1.0, 0.0)
+                tl.store(row_ptr + cols, (grad * coef).to(logits_ptr.dtype.element_ty),
+                         mask=valid)
 
 
 class FusedLMHeadCE(torch.autograd.Function):
@@ -105,7 +100,13 @@ class FusedLMHeadCE(torch.autograd.Function):
 
     hidden [N, H] (any float dtype; it is cast to fp16 as autocast casts the head's input),
     weight [V, H] fp16 and frozen, target [N] int64 with -100 for rows without a label,
-    denominator a 0-dim float tensor."""
+    denominator a 0-dim float tensor.
+
+    The gradient on hidden is taken in the forward pass, while each chunk of logits is still in
+    memory, so the backward pass needs neither the logits nor another matmul with the head. The
+    logits' gradient is rounded to fp16 at a power-of-two scale S ~ 256 * denominator (no fp16
+    overflow or underflow, whatever the grad scaler does); the backward pass multiplies by
+    grad_total / S. Labelled rows are processed first, so their gradient rows are contiguous."""
 
     @staticmethod
     def forward(ctx, hidden, weight, target, denominator):
@@ -115,50 +116,56 @@ class FusedLMHeadCE(torch.autograd.Function):
 
     @staticmethod
     def _forward(ctx, hidden, weight, target, denominator):
-        n, vocab = hidden.shape[0], weight.shape[0]
-        x16 = hidden.detach().to(torch.float16).contiguous()
-        target = target.contiguous()
-        lse = torch.empty(n, device=hidden.device, dtype=torch.float32)
+        n, width, vocab = hidden.shape[0], hidden.shape[1], weight.shape[0]
+        device = hidden.device
+        with_grad = ctx.needs_input_grad[0]
+        is_labelled = target != IGNORE_INDEX
+        labelled = is_labelled.nonzero().squeeze(1)
+        n_labelled = labelled.numel()
+        order = torch.cat((labelled, (~is_labelled).nonzero().squeeze(1)))
+        x16 = hidden.detach().index_select(0, order).to(torch.float16)
+        ordered_target = target.index_select(0, order).contiguous()
+
+        denominator = denominator.float().reshape(())
+        scale = torch.exp2(torch.floor(torch.log2(denominator.clamp(min=1.0))) + 8.0)
+        coef = (scale / denominator).reshape(1)
+        lse = torch.empty(n, device=device, dtype=torch.float32)
         loss = torch.empty_like(lse)
         entropy = torch.empty_like(lse)
-        hit = torch.empty(n, device=hidden.device, dtype=torch.int32)
-        buffer = torch.empty((min(n, ROWS_PER_CHUNK), vocab), device=hidden.device,
-                             dtype=torch.float16)
+        hit = torch.empty(n, device=device, dtype=torch.int32)
+        grad16 = torch.empty((n_labelled, width), device=device, dtype=torch.float16) \
+            if with_grad else None
+        buffer = torch.empty((min(n, ROWS_PER_CHUNK), vocab), device=device, dtype=torch.float16)
         for start in range(0, n, ROWS_PER_CHUNK):
             stop = min(n, start + ROWS_PER_CHUNK)
             logits = buffer[: stop - start]
             torch.matmul(x16[start:stop], weight.t(), out=logits)
-            lm_head_ce_stats_kernel[(stop - start,)](
-                logits, logits.stride(0), target[start:stop], lse[start:stop], loss[start:stop],
-                entropy[start:stop], hit[start:stop], vocab, BLOCK_V=BLOCK_V, NEG=NEG, num_warps=8)
+            lm_head_ce_kernel[(stop - start,)](
+                logits, logits.stride(0), ordered_target[start:stop], coef, lse[start:stop],
+                loss[start:stop], entropy[start:stop], hit[start:stop], vocab,
+                WITH_GRAD=with_grad, BLOCK_V=BLOCK_V, NEG=NEG, num_warps=8)
+            graded = min(stop, n_labelled) - start
+            if with_grad and graded > 0:
+                torch.matmul(logits[:graded], weight, out=grad16[start:start + graded])
         del buffer
+
+        def unorder(values):
+            return torch.empty_like(values).index_copy_(0, order, values)
+
+        loss, entropy, hit = unorder(loss), unorder(entropy), unorder(hit)
         total = loss.sum() / denominator
-        labelled = (target != IGNORE_INDEX).nonzero().squeeze(1)
-        ctx.save_for_backward(x16, weight, target, lse, labelled, denominator)
-        ctx.hidden_dtype = hidden.dtype
+        ctx.save_for_backward(grad16, labelled, scale)
+        ctx.shape, ctx.hidden_dtype = hidden.shape, hidden.dtype
         ctx.mark_non_differentiable(loss, entropy, hit)
         return total, loss, entropy, hit
 
     @staticmethod
     def backward(ctx, grad_total, _grad_loss, _grad_entropy, _grad_hit):
-        x16, weight, target, lse, labelled, denominator = ctx.saved_tensors
-        n, vocab = x16.shape[0], weight.shape[0]
-        grad_hidden = torch.zeros(x16.shape, device=x16.device, dtype=ctx.hidden_dtype)
-        if labelled.numel() == 0:
-            return grad_hidden, None, None, None
-        # d(total)/d(logit) = grad_total / denominator * (softmax - onehot), as ForCausalLMLoss
-        scale = (grad_total.float() / denominator.float()).reshape(1).contiguous()
-        rows = min(labelled.numel(), ROWS_PER_CHUNK)
-        buffer = torch.empty((rows, vocab), device=x16.device, dtype=torch.float16)
-        for start in range(0, labelled.numel(), ROWS_PER_CHUNK):
-            index = labelled[start:start + ROWS_PER_CHUNK]
-            logits = buffer[: index.numel()]
-            torch.matmul(x16.index_select(0, index), weight.t(), out=logits)
-            lm_head_ce_grad_kernel[(index.numel(),)](
-                logits, logits.stride(0), target.index_select(0, index).contiguous(),
-                lse.index_select(0, index).contiguous(), scale, vocab, BLOCK_V=BLOCK_V,
-                num_warps=8)
-            grad_hidden.index_copy_(0, index, (logits @ weight).to(ctx.hidden_dtype))
+        grad16, labelled, scale = ctx.saved_tensors
+        grad_hidden = torch.zeros(ctx.shape, device=grad_total.device, dtype=ctx.hidden_dtype)
+        if labelled.numel():
+            factor = grad_total.float() / scale
+            grad_hidden.index_copy_(0, labelled, (grad16.float() * factor).to(ctx.hidden_dtype))
         return grad_hidden, None, None, None
 
 
