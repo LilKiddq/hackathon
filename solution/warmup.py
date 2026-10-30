@@ -84,5 +84,9 @@ def start():
 
 
 def wait():
+    global _thread
     if _thread is not None:
         _thread.join()
+        _thread = None
+        # the warm-up's small blocks would otherwise stay cached next to the training's (~18 MiB)
+        torch.cuda.empty_cache()
