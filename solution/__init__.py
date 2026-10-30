@@ -13,8 +13,13 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .head_patch import patch_causal_lm, patch_sft_trainer
+from .rmsnorm import patch_qwen2_rmsnorm
 from .swiglu import patch_qwen2_mlp
 
 
 def apply():
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
+    patch_qwen2_rmsnorm()  # ours: fused RMSNorm forward + backward
+    patch_causal_lm()  # ours: lm_head + cross-entropy + entropy/accuracy without full logits
+    patch_sft_trainer()  # logs TRL's metrics and Soup's rewind losses from the fused step

@@ -1,0 +1,170 @@
+"""Wiring of the fused head + loss (fused_ce.py) into Soup's trainer.
+
+Two class patches, both looked up at call time:
+
+- `Qwen2ForCausalLM.forward`: while our trainer step asks for it (`_kc_active`), the decoder runs
+  as usual, the head is held back, and the loss comes from `fused_lm_head_ce` over the token rows
+  that carry attention. The output has the loss and no logits; what the trainer's metrics need is
+  left on the model as `_kc_step`. Any other call (generation, eval without labels, tests) takes
+  the original forward.
+- `trl.SFTTrainer.compute_loss`: TRL reads `outputs.logits` for `entropy` and
+  `mean_token_accuracy`. For a fused step we call transformers' own `compute_loss` and log the same
+  three columns by TRL's formulas. Soup's rewind recorder (a subclass of SFTTrainer) then finds
+  no logits and reads each token's loss from `trainer._soup_chunked_step.token_loss`, the hook
+  Soup itself uses for its chunked loss (#1693), so rewind.jsonl keeps the same rows and values.
+"""
+
+import types
+
+import torch
+from torch.nn import functional
+
+from .fused_ce import IGNORE_INDEX, fused_lm_head_ce
+
+STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR, read by rewind
+
+
+def _fp16_weight(module):
+    """A cached fp16 copy of the frozen head weight (the tied fp32 embedding). Base autocast makes
+    this same cast on every forward and keeps it for the backward; we make it once."""
+    weight = module.weight
+    cached = getattr(module, "_kc_weight16", None)
+    key = (weight.data_ptr(), weight._version, weight.device)
+    if cached is None or cached[0] != key:
+        cached = (key, weight.detach().to(torch.float16).contiguous())
+        module._kc_weight16 = cached
+    return cached[1]
+
+
+def _fused_forward(self, original, input_ids=None, attention_mask=None, position_ids=None,
+                   past_key_values=None, inputs_embeds=None, labels=None, use_cache=None,
+                   logits_to_keep=0, **kwargs):
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+
+    num_items_in_batch = kwargs.get("num_items_in_batch")
+    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
+                         position_ids=position_ids, past_key_values=past_key_values,
+                         inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
+    hidden = outputs.last_hidden_state
+    batch, seq, width = hidden.shape
+
+    # as ForCausalLMLoss: position t is scored against labels[t + 1], the last one against nothing
+    target = functional.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:].to(hidden.device)
+    keep = target != IGNORE_INDEX
+    if attention_mask is not None:
+        keep = keep | attention_mask.to(hidden.device).bool()  # entropy needs every real token
+    else:
+        keep = torch.ones_like(keep)
+    rows = keep.reshape(-1).nonzero().squeeze(1)
+    flat_target = target.reshape(-1)
+
+    if num_items_in_batch is None:
+        denominator = (flat_target != IGNORE_INDEX).sum()
+    elif torch.is_tensor(num_items_in_batch):
+        denominator = num_items_in_batch.to(hidden.device)
+    else:
+        denominator = torch.tensor(num_items_in_batch, device=hidden.device)
+
+    loss, row_loss, row_entropy, row_hit = fused_lm_head_ce(
+        hidden.reshape(-1, width).index_select(0, rows), _fp16_weight(self.lm_head),
+        flat_target.index_select(0, rows), denominator.float())
+
+    def scatter(values, dtype):
+        full = torch.zeros(batch * seq, device=hidden.device, dtype=dtype)
+        return full.index_copy_(0, rows, values.to(dtype)).view(batch, seq)
+
+    self._kc_step = types.SimpleNamespace(
+        token_loss=scatter(row_loss, torch.float32),        # [B, T], 0 where no label
+        token_entropy=scatter(row_entropy, torch.float32),  # [B, T], 0 on padding
+        correct=row_hit.sum(),
+        labelled=(flat_target != IGNORE_INDEX).sum(),
+    )
+    return CausalLMOutputWithPast(loss=loss, logits=None, past_key_values=outputs.past_key_values,
+                                  hidden_states=outputs.hidden_states,
+                                  attentions=outputs.attentions)
+
+
+def patch_causal_lm():
+    from transformers.models.qwen2 import modeling_qwen2
+
+    cls = modeling_qwen2.Qwen2ForCausalLM
+    if getattr(cls.forward, "_kc_patched", False):
+        return
+    original = cls.forward
+
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                past_key_values=None, inputs_embeds=None, labels=None, use_cache=None,
+                logits_to_keep=0, **kwargs):
+        if (getattr(self, "_kc_active", False) and labels is not None
+                and "shift_labels" not in kwargs and self.training):
+            return _fused_forward(self, original, input_ids, attention_mask, position_ids,
+                                  past_key_values, inputs_embeds, labels, use_cache,
+                                  logits_to_keep, **kwargs)
+        return original(self, input_ids=input_ids, attention_mask=attention_mask,
+                        position_ids=position_ids, past_key_values=past_key_values,
+                        inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
+                        logits_to_keep=logits_to_keep, **kwargs)
+
+    forward._kc_patched = True
+    forward.__doc__ = original.__doc__
+    cls.forward = forward
+
+
+def _causal_lm(model):
+    from transformers.models.qwen2 import modeling_qwen2
+
+    get_base_model = getattr(model, "get_base_model", None)
+    inner = get_base_model() if callable(get_base_model) else model
+    return inner if isinstance(inner, modeling_qwen2.Qwen2ForCausalLM) else None
+
+
+def patch_sft_trainer():
+    import trl
+    from transformers import Trainer
+
+    cls = trl.SFTTrainer
+    if getattr(cls.compute_loss, "_kc_patched", False):
+        return
+    original = cls.compute_loss
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        lm = _causal_lm(model) if isinstance(model, torch.nn.Module) else None
+        if (lm is None or not lm.training or not isinstance(inputs, dict)
+                or "labels" not in inputs or "shift_labels" in inputs
+                or "attention_mask" not in inputs
+                or getattr(self.args, "use_liger_kernel", False)
+                or getattr(self, "num_virtual_tokens", 0) > 0
+                or getattr(self, "aux_loss_enabled", False)
+                or not lm.lm_head.weight.is_cuda):
+            return original(self, model, inputs, return_outputs=return_outputs,
+                            num_items_in_batch=num_items_in_batch)
+
+        mode = "train"
+        inputs.pop("_prediction_loss_only", None)  # as TRL does before it delegates
+        inputs["use_cache"] = False
+        lm._kc_active = True
+        try:
+            loss, outputs = Trainer.compute_loss(self, model, inputs, return_outputs=True,
+                                                 num_items_in_batch=num_items_in_batch)
+        finally:
+            lm._kc_active = False
+        step = lm.__dict__.pop("_kc_step")
+
+        # TRL's three columns, by TRL's formulas (trl 0.29.1 SFTTrainer.compute_loss)
+        gather = self.accelerator.gather_for_metrics
+        attention_mask = inputs["attention_mask"]
+        with torch.no_grad():
+            entropy = torch.sum(step.token_entropy * attention_mask) / attention_mask.sum()
+        self._metrics[mode]["entropy"].append(gather(entropy).mean().item())
+        self._total_train_tokens += gather(attention_mask.sum()).sum().item()
+        self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
+        correct, total = gather(step.correct), gather(step.labelled)
+        total_sum = total.sum()
+        accuracy = (correct.sum() / total_sum).item() if total_sum > 0 else 0.0
+        self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+
+        setattr(self, STEP_ATTR, types.SimpleNamespace(token_loss=step.token_loss))
+        return (loss, outputs) if return_outputs else loss
+
+    compute_loss._kc_patched = True
+    cls.compute_loss = compute_loss
