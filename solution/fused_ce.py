@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 
 IGNORE_INDEX = -100
-ROWS_PER_CHUNK = 512  # 512 x 151936 fp16 logits = 156 MB alive at a time
+ROWS_PER_CHUNK = 256  # 256 x 151936 fp16 logits = 78 MB alive at a time
 BLOCK_V = 4096
 NEG = -1.0e30  # finite "minus infinity": keeps exp(a - b) free of inf - inf
 

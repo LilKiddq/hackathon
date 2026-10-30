@@ -30,27 +30,34 @@ def _compile_all():
 
     device = torch.device("cuda")
     hidden = 1536  # Qwen2.5-1.5B: the norms' and the head's width
+    # A generator of its own: Soup seeds the global one while this thread may still be running,
+    # and drawing from it here would shift the random numbers training uses (LoRA dropout).
+    gen = torch.Generator(device=device)
+    gen.manual_seed(0)
 
-    x = torch.randn(2, hidden, device=device, requires_grad=True)
+    def randn(*shape, dtype=torch.float32):
+        return torch.randn(*shape, device=device, dtype=dtype, generator=gen)
+
+    x = randn(2, hidden).requires_grad_()
     weight = torch.ones(hidden, device=device)
     rms_norm(x, weight, 1e-6).sum().backward()
 
-    residual = torch.randn(2, hidden, device=device, requires_grad=True)
-    delta = torch.randn(2, hidden, device=device, dtype=torch.float16, requires_grad=True)
+    residual = randn(2, hidden).requires_grad_()
+    delta = randn(2, hidden, dtype=torch.float16).requires_grad_()
     s, y = AddRMSNorm.apply(residual, delta, weight, 1e-6)
     (s.sum() + y.sum()).backward()
 
-    q = torch.randn(1, 5, 12, 128, device=device).transpose(1, 2).requires_grad_()
-    k = torch.randn(1, 5, 2, 128, device=device).transpose(1, 2).requires_grad_()
-    cos, sin = torch.rand(1, 5, 128, device=device), torch.rand(1, 5, 128, device=device)
+    q = randn(1, 5, 12, 128).transpose(1, 2).requires_grad_()
+    k = randn(1, 5, 2, 128).transpose(1, 2).requires_grad_()
+    cos, sin = randn(1, 5, 128), randn(1, 5, 128)
     q_out, k_out = RoPE.apply(q, k, cos, sin, torch.float16)  # as under fp16 autocast
     # dense gradients: .sum() would hand back stride-0 ones, another specialization
     torch.autograd.backward((q_out, k_out), (torch.ones_like(q_out), torch.ones_like(k_out)))
 
     rows, width, vocab = 8, 64, 4096  # the vocabulary only has to share 151936's divisibility
-    head_in = torch.randn(rows, width, device=device, requires_grad=True)
-    head = torch.randn(vocab, width, device=device, dtype=torch.float16)
-    target = torch.randint(0, vocab, (rows,), device=device)
+    head_in = randn(rows, width).requires_grad_()
+    head = randn(vocab, width, dtype=torch.float16)
+    target = torch.randint(0, vocab, (rows,), device=device, generator=gen)
     target[::2] = -100
     loss = fused_lm_head_ce(head_in, head, target, (target != -100).sum().float())[0]
     loss.backward()
@@ -62,8 +69,8 @@ def _compile_all():
                                   offset=torch.zeros((), device=device))
     dequantize_nf4(torch.zeros(1024, device=device, dtype=torch.uint8), state)
 
-    gate = torch.randn(2, 8960, device=device, dtype=torch.float16, requires_grad=True)
-    up = torch.randn(2, 8960, device=device, dtype=torch.float16, requires_grad=True)
+    gate = randn(2, 8960, dtype=torch.float16).requires_grad_()
+    up = randn(2, 8960, dtype=torch.float16).requires_grad_()
     swiglu(gate, up).sum().backward()
     torch.cuda.synchronize()
 

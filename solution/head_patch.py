@@ -66,9 +66,11 @@ def _fused_forward(self, original, input_ids=None, attention_mask=None, position
     else:
         denominator = torch.tensor(num_items_in_batch, device=hidden.device)
 
+    offload.OFFLOADER.release_all()  # the last layers' MLP pairs leave the GPU before the head
     loss, row_loss, row_entropy, row_hit = fused_lm_head_ce(
         hidden.reshape(-1, width).index_select(0, rows), _fp16_weight(self.lm_head),
         flat_target.index_select(0, rows), denominator.float())
+    offload.OFFLOADER.prefetch_last()  # and the last one comes back while the backward starts
 
     def scatter(values, dtype):
         full = torch.zeros(batch * seq, device=hidden.device, dtype=dtype)

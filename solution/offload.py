@@ -127,6 +127,21 @@ class Offloader:
             entry.gpu = None
         self.in_flight = waiting
 
+    def release_all(self):
+        """Wait for the transfers still in flight and drop their GPU tensors. Called before the
+        head, whose logits chunk would otherwise sit next to the last layers' pairs."""
+        for entry in self.in_flight:
+            entry.copied.synchronize()
+            entry.gpu = None
+        self.in_flight = []
+
+    def prefetch_last(self):
+        """Start copying the last pair back: it is the first one the backward pass needs."""
+        if self.entries:
+            last = self.entries[-1]
+            if last.gpu is None and last.back is None and last.host is not None:
+                self._fetch(last)
+
     def _fetch(self, entry):
         """Copy a pair back to the GPU on the copy stream. The buffers are allocated in the
         compute stream's order, and the copy starts after the compute work queued so far."""

@@ -277,3 +277,80 @@ def test_offloaded_swiglu_matches_and_frees_gpu_memory():
         torch.testing.assert_close(x.grad, ref_grad, rtol=0, atol=0)
     finally:
         OFFLOADER.armed = False
+
+
+def test_offloaded_swiglu_without_synchronization():
+    """Forward and backward straight after each other, transfers still in flight."""
+    from solution.offload import OFFLOADER, OffloadedSwiGLU, arena_bytes
+    from solution.swiglu import swiglu
+
+    torch.manual_seed(1)
+    layers, tokens, width, inter = 8, 517, 256, 2048
+    weights = [((torch.randn(width, inter, device="cuda") * 0.05).half(),
+                (torch.randn(width, inter, device="cuda") * 0.05).half(),
+                (torch.randn(inter, width, device="cuda") * 0.05).half()) for _ in range(layers)]
+    x0 = torch.randn(tokens, width, device="cuda", dtype=torch.float16)
+    grad_out = torch.randn(tokens, width, device="cuda", dtype=torch.float16)
+
+    def run(act):
+        x = x0.clone().requires_grad_()
+        h = x
+        for wg, wu, wd in weights:
+            h = h + act(h @ wg, h @ wu) @ wd
+        h.backward(grad_out)
+        return h.detach(), x.grad
+
+    ref, ref_grad = run(swiglu)
+    config = type("Config", (), {"num_hidden_layers": layers, "intermediate_size": inter})()
+    try:
+        for _ in range(3):  # several steps reuse the same host arena
+            OFFLOADER.new_step(arena_bytes(config, tokens))
+            out, grad = run(OffloadedSwiGLU.apply)
+            torch.testing.assert_close(out, ref, rtol=0, atol=0)
+            torch.testing.assert_close(grad, ref_grad, rtol=0, atol=0)
+            OFFLOADER.new_step(arena_bytes(config, tokens))
+            x = x0.clone().requires_grad_()
+            h = x
+            for wg, wu, wd in weights:
+                h = h + OffloadedSwiGLU.apply(h @ wg, h @ wu) @ wd
+            OFFLOADER.release_all()  # as before the head
+            OFFLOADER.prefetch_last()
+            h.backward(grad_out)
+            torch.testing.assert_close(x.grad, ref_grad, rtol=0, atol=0)
+    finally:
+        OFFLOADER.armed = False
+
+
+def test_warmup_leaves_the_global_rng_alone():
+    from solution import warmup
+
+    state = torch.cuda.get_rng_state()
+    warmup._compile_all()
+    assert torch.equal(torch.cuda.get_rng_state(), state)
+
+
+def test_unpad_never_reuses_an_earlier_batch():
+    """A padded batch, then a batch without padding of the same shape: the second one must run
+    on all of its tokens (it once reused the first batch's positions)."""
+    from transformers import Qwen2Config, Qwen2Model
+    from solution.unpad import patch_qwen2_unpad
+
+    patch_qwen2_unpad()
+    torch.manual_seed(0)
+    config = Qwen2Config(vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+                         num_attention_heads=4, num_key_value_heads=2, attn_implementation="sdpa")
+    model = Qwen2Model(config).cuda()
+    ids = torch.randint(0, 128, (4, 9), device="cuda")
+    padded = torch.ones(4, 9, dtype=torch.long, device="cuda")
+    padded[1, 6:] = 0
+    padded[3, 4:] = 0
+    full = torch.ones(4, 9, dtype=torch.long, device="cuda")
+
+    model.eval()
+    with torch.no_grad():
+        expected = model(input_ids=ids, attention_mask=full, use_cache=False).last_hidden_state
+    model.train()
+    out = model(input_ids=ids, attention_mask=padded, use_cache=False).last_hidden_state
+    out.sum().backward()
+    got = model(input_ids=ids, attention_mask=full, use_cache=False).last_hidden_state
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)

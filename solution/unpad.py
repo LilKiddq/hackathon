@@ -25,6 +25,9 @@ import torch
 # while a padded batch runs unpadded: (real positions [n] int64, batch, seq, row lengths or None);
 # the lengths are set when every row is a prefix of real tokens (TRL pads on the right)
 _ctx = None
+# the latest model forward's context, or None when it ran without unpadding: gradient
+# checkpointing re-runs layers inside that forward's backward pass and needs it again
+_last_ctx = None
 _rope_cache = {}  # per forward: the padded cos/sin -> cos/sin at each packed token's position
 
 
@@ -101,9 +104,12 @@ def patch_qwen2_unpad():
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
                 past_key_values=None, inputs_embeds=None, use_cache=None, **kwargs):
-        global _ctx
+        global _ctx, _last_ctx
+        if _ctx is None:
+            _last_ctx = None  # a new forward: never reuse an earlier batch's positions
         mask = attention_mask
-        if (_ctx is not None or not self.training or use_cache or past_key_values is not None
+        caching = use_cache if use_cache is not None else getattr(self.config, "use_cache", False)
+        if (_ctx is not None or not self.training or caching or past_key_values is not None
                 or not torch.is_tensor(mask) or mask.dim() != 2 or not mask.is_cuda
                 or getattr(self.config, "_attn_implementation", None) not in ("sdpa", "eager")
                 or bool(mask.all())):
@@ -115,6 +121,7 @@ def patch_qwen2_unpad():
         prefix = torch.arange(seq, device=mask.device)[None, :] < lengths[:, None]
         rows = lengths.tolist() if bool((mask.bool() == prefix).all()) else None
         _ctx = (mask.reshape(-1).nonzero().squeeze(1), batch, seq, rows)
+        _last_ctx = _ctx
         try:
             outputs = model_forward(self, input_ids=input_ids, attention_mask=attention_mask,
                                     position_ids=position_ids, past_key_values=past_key_values,
@@ -129,16 +136,13 @@ def patch_qwen2_unpad():
     def decoder_layer(self, hidden_states, *args, **kwargs):
         global _ctx
         ctx = _ctx
-        if ctx is not None:
-            self._kc_ctx = ctx
-        else:
-            # gradient checkpointing re-runs a layer in the backward pass, after the model's
-            # forward has returned: use the positions this layer ran with
-            saved = getattr(self, "_kc_ctx", None)
-            if (saved is not None and torch.is_grad_enabled() and hidden_states.dim() == 3
-                    and tuple(hidden_states.shape[:2]) in ((1, saved[0].numel()),
-                                                           (saved[1], saved[2]))):
-                ctx = saved
+        if (ctx is None and _last_ctx is not None and torch._C._current_graph_task_id() != -1
+                and hidden_states.dim() == 3
+                and tuple(hidden_states.shape[:2]) in ((1, _last_ctx[0].numel()),
+                                                       (_last_ctx[1], _last_ctx[2]))):
+            # gradient checkpointing re-runs this layer inside the backward pass of the latest
+            # forward (only there: the autograd engine is running) with that forward's positions
+            ctx = _last_ctx
         if ctx is None:
             return layer_forward(self, hidden_states, *args, **kwargs)
         if hidden_states.dim() == 3 and tuple(hidden_states.shape[:2]) == (ctx[1], ctx[2]):
