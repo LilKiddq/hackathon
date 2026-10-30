@@ -22,7 +22,10 @@ How (training only, when the batch has padding):
 
 import torch
 
-_ctx = None  # (real positions [n] int64, batch, seq) while a padded batch runs unpadded
+# while a padded batch runs unpadded: (real positions [n] int64, batch, seq, row lengths or None);
+# the lengths are set when every row is a prefix of real tokens (TRL pads on the right)
+_ctx = None
+_rope_cache = {}  # per forward: the padded cos/sin -> cos/sin at each packed token's position
 
 
 def _pack(x, index):
@@ -37,6 +40,52 @@ def _unpack(x, index, batch, seq):
 
 def _is_packed(x):
     return _ctx is not None and x.dim() == 3 and x.shape[0] == 1 and x.shape[1] == _ctx[0].numel()
+
+
+def _row_attention(module, hidden_states, position_embeddings, index, seq, rows):
+    """Attention on packed tokens, one causal SDPA call per row at its real length.
+
+    The rows are contiguous runs of the packed tokens, so each row's q/k/v is a slice: no padded
+    copies and no mask. Each real token attends to the same keys as with the padded mask (the
+    padding keys were masked out, the padding queries dropped). Keys and values are repeated for
+    the grouped heads and cast to fp16 once, as transformers' SDPA path does per call."""
+    from transformers.models.qwen2 import modeling_qwen2
+
+    n = hidden_states.shape[1]
+    shape = (1, n, -1, module.head_dim)
+    query = module.q_proj(hidden_states).view(shape).transpose(1, 2)
+    key = module.k_proj(hidden_states).view(shape).transpose(1, 2)
+    value = module.v_proj(hidden_states).view(shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    packed = _rope_cache.get(id(cos))
+    if packed is None:
+        if cos.shape[0] == 1:  # one table for the batch: flat position i is position i % seq
+            packed = tuple(t[0].index_select(0, index % seq)[None] for t in (cos, sin))
+        else:
+            packed = tuple(t.reshape(-1, t.shape[-1]).index_select(0, index)[None]
+                           for t in (cos, sin))
+        _rope_cache[id(cos)] = packed
+    query, key = modeling_qwen2.apply_rotary_pos_emb(query, key, *packed)
+
+    if torch.is_autocast_enabled("cuda"):  # the casts SDPA would make under autocast
+        dtype = torch.get_autocast_dtype("cuda")
+        query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
+    groups = getattr(module, "num_key_value_groups", 1)
+    key = modeling_qwen2.repeat_kv(key, groups)
+    value = modeling_qwen2.repeat_kv(value, groups)
+
+    outputs, start = [], 0
+    for length in rows:
+        if length == 0:
+            continue
+        stop = start + length
+        outputs.append(torch.nn.functional.scaled_dot_product_attention(
+            query[:, :, start:stop], key[:, :, start:stop], value[:, :, start:stop],
+            dropout_p=0.0, scale=module.scaling, is_causal=length > 1).transpose(1, 2))
+        start = stop
+    attn_output = torch.cat(outputs, dim=1).reshape(1, n, -1)
+    return module.o_proj(attn_output), None
 
 
 def patch_qwen2_unpad():
@@ -62,15 +111,19 @@ def patch_qwen2_unpad():
                                  position_ids=position_ids, past_key_values=past_key_values,
                                  inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
         batch, seq = mask.shape
-        _ctx = (mask.reshape(-1).nonzero().squeeze(1), batch, seq)
+        lengths = mask.sum(1)
+        prefix = torch.arange(seq, device=mask.device)[None, :] < lengths[:, None]
+        rows = lengths.tolist() if bool((mask.bool() == prefix).all()) else None
+        _ctx = (mask.reshape(-1).nonzero().squeeze(1), batch, seq, rows)
         try:
             outputs = model_forward(self, input_ids=input_ids, attention_mask=attention_mask,
                                     position_ids=position_ids, past_key_values=past_key_values,
                                     inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
             if _is_packed(outputs.last_hidden_state):
-                outputs.last_hidden_state = _unpack(outputs.last_hidden_state, *_ctx)
+                outputs.last_hidden_state = _unpack(outputs.last_hidden_state, *_ctx[:3])
         finally:
             _ctx = None
+            _rope_cache.clear()
         return outputs
 
     def decoder_layer(self, hidden_states, *args, **kwargs):
@@ -101,7 +154,10 @@ def patch_qwen2_unpad():
         if not _is_packed(hidden_states) or past_key_values is not None:
             return attention_forward(self, hidden_states, position_embeddings, attention_mask,
                                      past_key_values=past_key_values, **kwargs)
-        index, batch, seq = _ctx
+        index, batch, seq, rows = _ctx
+        if rows is not None and self.config._attn_implementation == "sdpa" \
+                and not kwargs.get("output_attentions", False):
+            return _row_attention(self, hidden_states, position_embeddings, index, seq, rows)
         hidden_shape = (batch, seq, -1, self.head_dim)
 
         def padded(proj):
@@ -125,7 +181,7 @@ def patch_qwen2_unpad():
     def dropout(self, x):
         # LoRA's dropout on packed tokens: draw the mask for the padded shape, then pack it
         if self.training and self.p > 0 and _is_packed(x):
-            index, batch, seq = _ctx
+            index, batch, seq = _ctx[:3]
             return _pack(dropout_forward(self, _unpack(x, index, batch, seq)), index)
         return dropout_forward(self, x)
 
