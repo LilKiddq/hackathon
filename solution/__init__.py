@@ -17,6 +17,7 @@ from .head_patch import patch_causal_lm, patch_sft_trainer
 from .mlp import patch_qwen2_mlp_fp16
 from .nf4 import patch_bnb_matmul_4bit
 from .rmsnorm import patch_qwen2_rmsnorm
+from .rope import patch_qwen2_rope
 from .swiglu import patch_qwen2_mlp
 
 
@@ -24,6 +25,7 @@ def apply():
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
     patch_qwen2_mlp_fp16()  # the MLP around it on the fp16 path: half the saved activations
     patch_qwen2_rmsnorm()  # ours: fused RMSNorm forward + backward
+    patch_qwen2_rope()  # ours: fused rotary embedding for q and k, forward + backward
     patch_causal_lm()  # ours: lm_head + cross-entropy + entropy/accuracy without full logits
     patch_sft_trainer()  # logs TRL's metrics and Soup's rewind losses from the fused step
     patch_bnb_matmul_4bit()  # ours: one-launch NF4 dequantization for every 4-bit layer

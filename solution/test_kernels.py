@@ -107,3 +107,71 @@ def test_nf4_dequant_matches_bitsandbytes(shape):
     ref_out.backward(grad)
     torch.testing.assert_close(out, ref_out, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(x.grad, xr.grad, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("table_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("batch,seq,dim,table_batch", [(4, 512, 128, 4), (3, 77, 96, 1)])
+@pytest.mark.parametrize("used", ["both", "q", "k"])
+def test_rope_matches_qwen2(dtype, table_dtype, batch, seq, dim, table_batch, used):
+    from transformers.models.qwen2 import modeling_qwen2
+    from solution.rope import patch_qwen2_rope
+
+    patch_qwen2_rope()
+    patched = modeling_qwen2.apply_rotary_pos_emb
+    original = patched.__wrapped__
+    patch_qwen2_rope()
+    assert modeling_qwen2.apply_rotary_pos_emb is patched
+
+    torch.manual_seed(17)
+    # Projection views in Qwen2 are noncontiguous [B, H, T, D].
+    q = torch.randn(batch, seq, 12, dim, device="cuda", dtype=dtype).transpose(1, 2).requires_grad_()
+    k = torch.randn(batch, seq, 2, dim, device="cuda", dtype=dtype).transpose(1, 2).requires_grad_()
+    # Strided tables and independent halves also catch incorrect inverse-rotation backward.
+    angles = torch.randn(table_batch, seq, dim * 2, device="cuda")
+    cos, sin = angles.cos().to(table_dtype)[..., ::2], angles.sin().to(table_dtype)[..., ::2]
+    out_dtype = torch.promote_types(dtype, table_dtype)
+    gq = torch.randn(batch, seq, 12, dim, device="cuda", dtype=out_dtype).transpose(1, 2)
+    gk = torch.randn(batch, seq, 2, dim, device="cuda", dtype=out_dtype).transpose(1, 2)
+    outputs = (0, 1) if used == "both" else ((0,) if used == "q" else (1,))
+
+    with torch.autocast("cuda", dtype=torch.float16, enabled=dtype == torch.float16):
+        ref = original(q, k, cos, sin)
+        ref_grads = torch.autograd.grad(tuple(ref[i] for i in outputs), (q, k),
+                                       tuple((gq, gk)[i] for i in outputs), allow_unused=True)
+        out = patched(q, k, cos, sin)
+        grads = torch.autograd.grad(tuple(out[i] for i in outputs), (q, k),
+                                   tuple((gq, gk)[i] for i in outputs), allow_unused=True)
+    tol = TOLERANCE[dtype]
+    for actual, expected in zip(out, ref):
+        torch.testing.assert_close(actual, expected, rtol=tol, atol=tol)
+    for actual, expected in zip(grads, ref_grads):
+        if expected is None:
+            assert actual is None
+        else:
+            torch.testing.assert_close(actual, expected, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("unsqueeze_dim", [1, 2])
+def test_rope_cpu_fallback(dtype, unsqueeze_dim):
+    from transformers.models.qwen2 import modeling_qwen2
+    from solution.rope import patch_qwen2_rope
+
+    patch_qwen2_rope()
+    patched = modeling_qwen2.apply_rotary_pos_emb
+    original = patched.__wrapped__
+    shape = (2, 3, 5, 8) if unsqueeze_dim == 1 else (2, 5, 3, 8)
+    q = torch.randn(shape, dtype=dtype, requires_grad=True)
+    k = torch.randn(shape, dtype=dtype, requires_grad=True)
+    cos = torch.randn(2, 5, 8, dtype=dtype, requires_grad=True)
+    sin = torch.randn_like(cos, requires_grad=True)
+    ref = original(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    out = patched(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    for actual, expected in zip(out, ref):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    grad = tuple(torch.randn_like(t) for t in ref)
+    ref_grads = torch.autograd.grad(ref, (q, k, cos, sin), grad)
+    grads = torch.autograd.grad(out, (q, k, cos, sin), grad)
+    for actual, expected in zip(grads, ref_grads):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
