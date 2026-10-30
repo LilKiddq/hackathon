@@ -14,6 +14,7 @@ LoRA, оптимизатор и расписание не меняются.
 | NF4 | nf4.py / nf4_dequant_kernel | Double-quantized scale и распаковка NF4 в один запуск, отдельный matmul PyTorch/cuBLAS; поддержан замороженный bias |
 | Add + RMSNorm | add_rmsnorm.py / add_rmsnorm_fwd_kernel, add_rmsnorm_bwd_kernel | Residual add и post-attention RMSNorm одним запуском в каждую сторону; сохраняются только s и inverse RMS |
 | MLP fp16 | mlp.py | Gate/up и SwiGLU на fp16-пути, сокращение сохранённых активаций; residual остаётся fp32 |
+| Компиляция в фоне | warmup.py | apply() запускает каждый кернел один раз на маленьких тензорах в фоновом потоке, пока Soup загружает модель; компиляция с пустого кэша остаётся внутри замера, но не задерживает первые шаги |
 | SwiGLU | swiglu.py | Пример организаторов; не заявляется собственным кернелом |
 
 В актуальном CE градиент hidden вычисляется уже в forward, пока chunk logits находится в памяти.

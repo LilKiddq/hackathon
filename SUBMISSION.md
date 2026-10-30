@@ -3,7 +3,7 @@
 ## Links
 
 - Repository: https://github.com/LilKiddq/hackathon
-- Final commit: https://github.com/LilKiddq/hackathon/commit/9357ef1c745a6672548ec1b782aabe68e4a85fa2
+- Final commit: TBD (измеренный код решения — коммит 6ca2a93; финальный коммит добавит только документацию)
 - Kaggle, сохранённый запуск: https://www.kaggle.com/code/bloovw/notebookca2/output
 - Ссылка на конкретную версию с scriptVersionId: TBD. Публичность нового ноутбука ещё подтвердить.
 - Demo video, до 3 минут: TBD.
@@ -20,24 +20,25 @@
 
 ## Our kernels
 
-Подтверждённые запуски: lm_head_ce_kernel, nf4_dequant_kernel,
-rms_norm_bwd_kernel, rms_norm_fwd_kernel, rope_rotate_kernel.
-Суммарная доля: 9,3% по check 4; индивидуальные доли здесь не подтверждены.
+Подтверждённые запуски: add_rmsnorm_fwd_kernel, add_rmsnorm_bwd_kernel, lm_head_ce_kernel,
+nf4_dequant_kernel, rms_norm_fwd_kernel, rms_norm_bwd_kernel, rope_rotate_kernel.
+Суммарная доля: 9,9 % по check 4 (минимум из двух запусков); индивидуальные доли не измерялись.
 SwiGLU — пример организаторов, не собственный вклад.
-Алгоритмы и источники: docs/IMPLEMENTATION.md и README.md. Архив исходников совпал с solution_sha256 из проверки.
+Алгоритмы и источники: docs/IMPLEMENTATION.md и README.md.
 
 ## Results on Kaggle T4
 
-| Метрика | Base Soup | Решение | Отношение |
-|---|---|---|---|
-| Полное время, с | 89,56 | 70,31 | 1,2738× ускорение |
-| Пик GPU-памяти, MiB | 14 345 | 5 465 | 2,6249× меньше |
-| Eval loss | 2,04966 | 2,04966 | практически без изменения |
+`harness/run_task.py --repeats 2` (база, решение, решение, база), коммит 6ca2a93:
 
-- [x] Все 10 checks PASS по приложенным evidence/checks.json.
-- [x] 79 тестов Soup PASS.
+| Метрика | Base Soup | Решение | Отношение |
+|---|---:|---:|---:|
+| Полное время, с | 78,0 | 60,2 | 1,296× ускорение |
+| Пик GPU-памяти, MiB | 14 345 | 5 425 | 2,644× меньше |
+| Eval loss | 2,04966 | 2,04965 | −0,000 % |
+
+- [x] Все 10 checks PASS (--repeats 2), 44 теста solution и 79 тестов Soup PASS.
 - [x] Техническое описание сверено с архивом исходников; источники из комментариев перечислены. Происхождение кода подтверждает команда.
-- [x] Финальный commit подтверждён файлом COMMIT.txt.
+- [ ] Финальный коммит вписан.
 - [ ] Подтверждена публичность нового notebook и добавлен scriptVersionId.
 - [x] Название команды и четыре участника заполнены.
 - [ ] Роли, профили и контакт капитана заполнены.
@@ -46,5 +47,4 @@ SwiGLU — пример организаторов, не собственный 
 
 ## Limitations
 
-Одна пара запусков, seed=1, открытые данные; скрытая проверка жюри ещё не выполнена.
-Результаты и хеши: RESULTS.md. Происхождение кода подтверждает команда.
+Открытые данные, seed 1; скрытая проверка жюри ещё не выполнена. Подробности и ограничения: README.md и RESULTS.md.
