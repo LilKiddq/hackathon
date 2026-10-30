@@ -201,3 +201,33 @@ def test_add_rmsnorm_matches_pytorch(delta_dtype, shape):
     torch.testing.assert_close(y2, y, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(residual.grad, ref_dr, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(delta.grad, ref_dd, rtol=tol, atol=tol)
+
+
+def test_rope_fp16_store_under_autocast_matches_cast():
+    """Under fp16 autocast the patched RoPE stores fp32 math as fp16: the same values attention
+    gets from casting transformers' fp32 output, and the same fp32 gradients."""
+    from transformers.models.qwen2 import modeling_qwen2
+    from solution.rope import patch_qwen2_rope
+
+    patch_qwen2_rope()
+    patched = modeling_qwen2.apply_rotary_pos_emb
+    original = patched.__wrapped__
+    torch.manual_seed(3)
+    q = torch.randn(4, 77, 12, 128, device="cuda").transpose(1, 2).requires_grad_()
+    k = torch.randn(4, 77, 2, 128, device="cuda").transpose(1, 2).requires_grad_()
+    angles = torch.randn(4, 77, 64, device="cuda").repeat(1, 1, 2)
+    cos, sin = angles.cos(), angles.sin()
+    gq = torch.randn(4, 12, 77, 128, device="cuda", dtype=torch.float16)
+    gk = torch.randn(4, 2, 77, 128, device="cuda", dtype=torch.float16)
+
+    with torch.autocast("cuda", dtype=torch.float16):
+        ref_q, ref_k = (t.half() for t in original(q, k, cos, sin))
+        ref_grads = torch.autograd.grad((ref_q, ref_k), (q, k), (gq, gk))
+        out_q, out_k = patched(q, k, cos, sin)
+        grads = torch.autograd.grad((out_q, out_k), (q, k), (gq, gk))
+    assert out_q.dtype == out_k.dtype == torch.float16
+    torch.testing.assert_close(out_q, ref_q, rtol=0, atol=0)
+    torch.testing.assert_close(out_k, ref_k, rtol=0, atol=0)
+    for actual, expected in zip(grads, ref_grads):
+        assert actual.dtype == torch.float32
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)

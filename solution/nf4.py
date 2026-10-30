@@ -30,7 +30,8 @@ NF4_TABLE = (
 @triton.jit
 def nf4_dequant_kernel(packed_ptr, absmax8_ptr, code2_ptr, absmax2_ptr, offset_ptr, table_ptr,
                        out_ptr, n_bytes, n_out, HALF_BLOCK: tl.constexpr,
-                       GROUP2: tl.constexpr, BLOCK_BYTES: tl.constexpr, EXACT: tl.constexpr):
+                       GROUP2: tl.constexpr, BLOCK_BYTES: tl.constexpr, EXACT: tl.constexpr,
+                       PACKED_FP16: tl.constexpr):
     pid = tl.program_id(0)
     byte_idx = pid * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
     valid = byte_idx < n_bytes
@@ -50,9 +51,16 @@ def nf4_dequant_kernel(packed_ptr, absmax8_ptr, code2_ptr, absmax2_ptr, offset_p
     scale = scale + tl.load(offset_ptr)
     high = tl.load(table_ptr + (packed >> 4), mask=valid, other=0.0) * scale
     low = tl.load(table_ptr + (packed & 15), mask=valid, other=0.0) * scale
-    weights = tl.interleave(high, low).to(out_ptr.dtype.element_ty)
-    out_idx = pid * (2 * BLOCK_BYTES) + tl.arange(0, 2 * BLOCK_BYTES)
-    tl.store(out_ptr + out_idx, weights, mask=out_idx < n_out)
+    if PACKED_FP16:
+        # out_ptr is the fp16 output viewed as int32: one 4-byte word per packed byte, the high
+        # nibble's weight in the low half (little endian), so the stores are plain and coalesced
+        high_bits = high.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+        low_bits = low.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+        tl.store(out_ptr + byte_idx, high_bits | (low_bits << 16), mask=valid)
+    else:
+        weights = tl.interleave(high, low).to(out_ptr.dtype.element_ty)
+        out_idx = pid * (2 * BLOCK_BYTES) + tl.arange(0, 2 * BLOCK_BYTES)
+        tl.store(out_ptr + out_idx, weights, mask=out_idx < n_out)
 
 
 _tables = {}
@@ -87,11 +95,12 @@ def dequantize_nf4(packed, quant_state, dtype=torch.float16):
     offset = quant_state.offset
     if not torch.is_tensor(offset):
         offset = torch.tensor(float(offset), device=packed.device)
+    packed_fp16 = dtype == torch.float16 and quant_state.shape[1] % 2 == 0
     nf4_dequant_kernel[(triton.cdiv(n_bytes, BLOCK_BYTES),)](
         flat, quant_state.absmax, state2.code, state2.absmax, offset.float().reshape(1),
-        _table(packed.device), out, n_bytes, n_out,
+        _table(packed.device), out.view(torch.int32) if packed_fp16 else out, n_bytes, n_out,
         HALF_BLOCK=quant_state.blocksize // 2, GROUP2=state2.blocksize, BLOCK_BYTES=BLOCK_BYTES,
-        EXACT=packed.is_cuda, num_warps=4, enable_fp_fusion=False)
+        EXACT=packed.is_cuda, PACKED_FP16=packed_fp16, num_warps=4, enable_fp_fusion=False)
     return out
 
 

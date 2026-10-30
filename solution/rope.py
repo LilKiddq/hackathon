@@ -28,10 +28,12 @@ _VARYING = ["sxb", "sxh", "sxt", "scb", "sct", "ssb", "sst", "seq", "tokens"]
 def rope_rotate_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr,
                        sxb, sxh, sxt, sxd, scb, sct, scd, ssb, sst, ssd,
                        seq, tokens, heads,
-                       D: tl.constexpr, BACKWARD: tl.constexpr,
+                       D: tl.constexpr, BACKWARD: tl.constexpr, COMPUTE_FP16: tl.constexpr,
                        BLOCK_D: tl.constexpr, BLOCK_T: tl.constexpr):
     """y = x * cos + rotate_half(x) * sin (or its transpose for BACKWARD), one head per
-    program column; y is a contiguous [batch, heads, seq, D] tensor."""
+    program column; y is a contiguous [batch, heads, seq, D] tensor. The math runs in the
+    dtype PyTorch would use (fp16 products when COMPUTE_FP16, fp32 otherwise) and is rounded
+    once more to y's dtype on the store."""
     rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     head = tl.program_id(1)
     batch = rows // seq
@@ -54,13 +56,16 @@ def rope_rotate_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr,
         # rotate_half(x)[j] = -x[j + D/2] for the first half, x[j - D/2] for the second
         s = tl.load(sin_ptr + s_row + cols[None, :] * ssd, valid, other=0).to(tl.float32)
         sign = tl.where(cols < D // 2, -1.0, 1.0)
-    first = (x * c).to(y_ptr.dtype.element_ty).to(tl.float32)
-    second = (x_pair * s).to(y_ptr.dtype.element_ty).to(tl.float32)
+    first = x * c
+    second = x_pair * s
+    if COMPUTE_FP16:
+        first = first.to(tl.float16).to(tl.float32)
+        second = second.to(tl.float16).to(tl.float32)
     y_row = ((batch * heads + head) * seq + pos)[:, None] * D
     tl.store(y_ptr + y_row + cols[None, :], first + sign[None, :] * second, valid)
 
 
-def _rotate(x, cos, sin, out, backward):
+def _rotate(x, cos, sin, out, backward, compute_dtype):
     batch, heads, seq, dim = x.shape
     # a size-one batch of cos/sin is broadcast over the batch
     cb = 0 if cos.shape[0] == 1 else cos.stride(0)
@@ -68,7 +73,8 @@ def _rotate(x, cos, sin, out, backward):
     rope_rotate_kernel[(triton.cdiv(batch * seq, BLOCK_T), heads)](
         x, cos, sin, out, *x.stride(), cb, cos.stride(1), cos.stride(2),
         sb, sin.stride(1), sin.stride(2), seq, batch * seq, heads,
-        D=dim, BACKWARD=backward, BLOCK_D=triton.next_power_of_2(dim), BLOCK_T=BLOCK_T,
+        D=dim, BACKWARD=backward, COMPUTE_FP16=compute_dtype == torch.float16,
+        BLOCK_D=triton.next_power_of_2(dim), BLOCK_T=BLOCK_T,
         num_warps=4, enable_fp_fusion=False)
     return out
 
@@ -77,15 +83,17 @@ class RoPE(torch.autograd.Function):
     """RoPE for [batch, heads, seq, dim] q/k and frozen [batch or 1, seq, dim] cos/sin."""
 
     @staticmethod
-    def forward(ctx, q, k, cos, sin):
-        q_out = torch.empty(q.shape, device=q.device, dtype=torch.promote_types(q.dtype, cos.dtype))
-        k_out = torch.empty(k.shape, device=k.device, dtype=torch.promote_types(k.dtype, cos.dtype))
-        _rotate(q, cos, sin, q_out, False)
-        _rotate(k, cos, sin, k_out, False)
+    def forward(ctx, q, k, cos, sin, out_dtype=None):
+        """out_dtype: the dtype to store q and k in; by default the dtype of the math."""
+        outs = []
+        for x in (q, k):
+            compute = torch.promote_types(x.dtype, cos.dtype)
+            out = torch.empty(x.shape, device=x.device, dtype=out_dtype or compute)
+            outs.append(_rotate(x, cos, sin, out, False, compute))
         ctx.save_for_backward(cos, sin)
         ctx.dtypes = (q.dtype, k.dtype)
         ctx.set_materialize_grads(False)
-        return q_out, k_out
+        return outs[0], outs[1]
 
     @staticmethod
     def backward(ctx, dq, dk):
@@ -96,8 +104,9 @@ class RoPE(torch.autograd.Function):
                 grads.append(None)
             else:
                 out = torch.empty(grad.shape, device=grad.device, dtype=dtype)
-                grads.append(_rotate(grad, cos, sin, out, True))
-        return grads[0], grads[1], None, None
+                compute = torch.promote_types(dtype, cos.dtype)
+                grads.append(_rotate(grad, cos, sin, out, True, compute))
+        return grads[0], grads[1], None, None, None
 
 
 def patch_qwen2_rope():
@@ -121,7 +130,16 @@ def patch_qwen2_rope():
                 or any(size == 0 for t in tensors for size in t.shape)
                 or q.shape[-1] % 2 or q.shape[-1] > 256):
             return original(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-        return RoPE.apply(q, k, cos, sin)
+        # Under fp16 autocast the only consumer, attention (SDPA or eager matmuls), casts q and k
+        # to fp16 first. Storing the rotated fp32 values as fp16 here is that same rounding,
+        # without the fp32 copies and the casts; their gradients come back in fp16 and are
+        # widened to fp32 exactly, as the cast's backward would.
+        out_dtype = None
+        if (q.dtype == torch.float32 and cos.dtype == torch.float32
+                and torch.is_autocast_enabled("cuda")
+                and torch.get_autocast_dtype("cuda") == torch.float16):
+            out_dtype = torch.float16
+        return RoPE.apply(q, k, cos, sin, out_dtype)
 
     apply_rotary_pos_emb._kc_patched = True
     modeling_qwen2.apply_rotary_pos_emb = apply_rotary_pos_emb

@@ -41,7 +41,7 @@ def _compile_all():
     q = torch.randn(1, 5, 12, 128, device=device).transpose(1, 2).requires_grad_()
     k = torch.randn(1, 5, 2, 128, device=device).transpose(1, 2).requires_grad_()
     cos, sin = torch.rand(1, 5, 128, device=device), torch.rand(1, 5, 128, device=device)
-    q_out, k_out = RoPE.apply(q, k, cos, sin)
+    q_out, k_out = RoPE.apply(q, k, cos, sin, torch.float16)  # as under fp16 autocast
     # dense gradients: .sum() would hand back stride-0 ones, another specialization
     torch.autograd.backward((q_out, k_out), (torch.ones_like(q_out), torch.ones_like(k_out)))
 
