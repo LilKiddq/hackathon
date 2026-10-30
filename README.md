@@ -69,6 +69,20 @@ Final commit: 9357ef1c745a6672548ec1b782aabe68e4a85fa2. Команда: Kuchbrtn
 
 Все 10 checks PASS; собственные кернелы 9,3%; 79 тестов Soup PASS.
 Один запуск каждой стороны, seed=1, открытая eval-выборка. Скрытые данные и повторы жюри не проверены.
+### Микробенчмарки кернелов (Kaggle T4)
+
+`python tools/bench_kernels.py`, медиана 50 замеров, forward + backward (NF4 — только распаковка).
+
+| Кернел | PyTorch, мс | Наш, мс | Ускорение | Память PyTorch → наша, MiB | Max diff |
+|---|---:|---:|---:|---:|---:|
+| fused lm_head + CE (2048 × 1536 × 151936) | 197,3 | 107,6 | 1,83× | 5 820 → 635 | 4,6e-5 |
+| RMSNorm (4 × 512 × 1536, fp32) | 1,47 | 0,47 | 3,11× | 112 → 64 | 1,4e-6 |
+| RoPE (q 4×12×512×128, k 4×2×512×128) | 1,77 | 0,69 | 2,57× | 97 → 85 | 0 |
+| NF4 dequant 8960 × 1536 | 0,341 | 0,223 | 1,53× | 50 → 49 | 0 |
+| NF4 dequant 1536 × 1536 | 0,153 | 0,096 | 1,59× | 22 → 22 | 0 |
+
+Полный вывод: [evidence/bench_kernels.md](evidence/bench_kernels.md). `pytest solution` на T4: 43 passed.
+
 Подробности и контрольные суммы: [RESULTS.md](RESULTS.md).
 Исходные результаты: [result.json](evidence/result.json), [checks.json](evidence/checks.json).
 Форма сдачи: [SUBMISSION.md](SUBMISSION.md).
