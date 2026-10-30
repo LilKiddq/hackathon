@@ -67,9 +67,9 @@ def _compile_all():
 
 
 def _run():
+    # on the default stream: a stream of its own would get its own cuBLAS workspace (+44 MiB peak)
     try:
-        with torch.cuda.stream(torch.cuda.Stream()):
-            _compile_all()
+        _compile_all()
     except Exception:  # noqa: BLE001 - a failed warm-up only means the kernels compile later
         pass
 
