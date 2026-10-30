@@ -85,3 +85,25 @@ def test_fused_lm_head_ce_matches_pytorch(rows, vocab):
     torch.testing.assert_close(entropy, ref_entropy, rtol=1e-4, atol=1e-4)
     assert int(hit.sum()) == int(ref_hits)
     torch.testing.assert_close(hidden.grad, ref_grad, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("shape", [(1536, 1536), (8960, 1536), (256, 1536)])
+def test_nf4_dequant_matches_bitsandbytes(shape):
+    import bitsandbytes.functional as F
+    from solution.nf4 import NF4Linear, dequantize_nf4
+
+    torch.manual_seed(0)
+    w = (torch.randn(shape, device="cuda") * 0.02).half()
+    packed, state = F.quantize_4bit(w, blocksize=64, quant_type="nf4", compress_statistics=True)
+    ref = F.dequantize_4bit(packed, state).half()
+    torch.testing.assert_close(dequantize_nf4(packed, state), ref, rtol=0, atol=0)
+
+    x = torch.randn(3, 77, shape[1], device="cuda", dtype=torch.float16, requires_grad=True)
+    grad = torch.randn(3, 77, shape[0], device="cuda", dtype=torch.float16)
+    out = NF4Linear.apply(x, packed, state)
+    out.backward(grad)
+    xr = x.detach().requires_grad_(True)
+    ref_out = xr @ ref.t()
+    ref_out.backward(grad)
+    torch.testing.assert_close(out, ref_out, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(x.grad, xr.grad, rtol=2e-3, atol=2e-3)
