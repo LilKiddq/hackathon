@@ -30,7 +30,7 @@ NF4_TABLE = (
 @triton.jit
 def nf4_dequant_kernel(packed_ptr, absmax8_ptr, code2_ptr, absmax2_ptr, offset_ptr, table_ptr,
                        out_ptr, n_bytes, n_out, HALF_BLOCK: tl.constexpr,
-                       GROUP2: tl.constexpr, BLOCK_BYTES: tl.constexpr):
+                       GROUP2: tl.constexpr, BLOCK_BYTES: tl.constexpr, EXACT: tl.constexpr):
     pid = tl.program_id(0)
     byte_idx = pid * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
     valid = byte_idx < n_bytes
@@ -38,8 +38,15 @@ def nf4_dequant_kernel(packed_ptr, absmax8_ptr, code2_ptr, absmax2_ptr, offset_p
     # both codes of a byte sit in the same quantization block (blocksize is even)
     block = byte_idx // HALF_BLOCK
     absmax8 = tl.load(absmax8_ptr + block, mask=valid, other=0).to(tl.int32)
-    scale = tl.load(code2_ptr + absmax8, mask=valid, other=0.0) \
-        * tl.load(absmax2_ptr + block // GROUP2, mask=valid, other=0.0)
+    code2 = tl.load(code2_ptr + absmax8, mask=valid, other=0.0)
+    absmax2 = tl.load(absmax2_ptr + block // GROUP2, mask=valid, other=0.0)
+    if EXACT:
+        # bitsandbytes rounds the product before adding the offset (two kernels); a plain
+        # `a * b + c` here is contracted into one FMA and differs in the last bit
+        scale = tl.inline_asm_elementwise("mul.rn.f32 $0, $1, $2;", "=r,r,r", [code2, absmax2],
+                                          dtype=tl.float32, is_pure=True, pack=1)
+    else:  # the Triton interpreter (CPU) has no PTX
+        scale = code2 * absmax2
     scale = scale + tl.load(offset_ptr)
     high = tl.load(table_ptr + (packed >> 4), mask=valid, other=0.0) * scale
     low = tl.load(table_ptr + (packed & 15), mask=valid, other=0.0) * scale
@@ -84,7 +91,7 @@ def dequantize_nf4(packed, quant_state, dtype=torch.float16):
         flat, quant_state.absmax, state2.code, state2.absmax, offset.float().reshape(1),
         _table(packed.device), out, n_bytes, n_out,
         HALF_BLOCK=quant_state.blocksize // 2, GROUP2=state2.blocksize, BLOCK_BYTES=BLOCK_BYTES,
-        num_warps=4)
+        EXACT=packed.is_cuda, num_warps=4)
     return out
 
 
