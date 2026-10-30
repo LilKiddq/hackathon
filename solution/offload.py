@@ -68,7 +68,7 @@ class Offloader:
             self.stream.synchronize()
         self.entries, self.in_flight, self.cursor = [], [], 0
         if nbytes:
-            self.reserve(nbytes)
+            self._reserve_quietly(nbytes)  # if pinning fails, the step runs without offloading
         self.armed = self.arena is not None
 
     def active(self, gate):
