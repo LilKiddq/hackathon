@@ -19,9 +19,12 @@ import triton
 import triton.language as tl
 
 BLOCK_T = 4  # token rows per program
+# The padded length changes every step. Triton would compile a new variant whenever one of these
+# integers changes whether it is divisible by 16, and compile time counts in the measured run.
+_VARYING = ["sxb", "sxh", "sxt", "scb", "sct", "ssb", "sst", "seq", "tokens"]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=_VARYING)
 def rope_rotate_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr,
                        sxb, sxh, sxt, sxd, scb, sct, scd, ssb, sst, ssd,
                        seq, tokens, heads,
