@@ -231,3 +231,49 @@ def test_rope_fp16_store_under_autocast_matches_cast():
     for actual, expected in zip(grads, ref_grads):
         assert actual.dtype == torch.float32
         torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_offloaded_swiglu_matches_and_frees_gpu_memory():
+    """A chain of MLP-like layers: the offloaded SwiGLU gives the same outputs and gradients,
+    and once its transfers are done the gate/up pairs no longer occupy GPU memory."""
+    from solution.offload import OFFLOADER, OffloadedSwiGLU, arena_bytes
+    from solution.swiglu import swiglu
+
+    torch.manual_seed(0)
+    layers, tokens, width, inter = 6, 333, 256, 1024
+    weights = [((torch.randn(width, inter, device="cuda") * 0.05).half(),
+                (torch.randn(width, inter, device="cuda") * 0.05).half(),
+                (torch.randn(inter, width, device="cuda") * 0.05).half()) for _ in range(layers)]
+    x0 = torch.randn(tokens, width, device="cuda", dtype=torch.float16)
+    grad_out = torch.randn(tokens, width, device="cuda", dtype=torch.float16)
+
+    def run(act):
+        x = x0.clone().requires_grad_()
+        h = x
+        for wg, wu, wd in weights:
+            h = h + act(h @ wg, h @ wu) @ wd
+        return x, h
+
+    before = torch.cuda.memory_allocated()
+    x, ref = run(swiglu)
+    kept_plain = torch.cuda.memory_allocated() - before
+    ref.backward(grad_out)
+    ref_grad = x.grad
+    del x
+
+    config = type("Config", (), {"num_hidden_layers": layers, "intermediate_size": inter})()
+    OFFLOADER.new_step(arena_bytes(config, tokens))
+    try:
+        before = torch.cuda.memory_allocated()
+        x, out = run(OffloadedSwiGLU.apply)
+        torch.cuda.synchronize()
+        OFFLOADER._retire()
+        assert all(entry.host is not None and entry.gpu is None for entry in OFFLOADER.entries)
+        kept = torch.cuda.memory_allocated() - before
+        pairs = layers * 2 * tokens * inter * 2  # every layer's gate and up, fp16
+        assert kept <= kept_plain - 0.9 * pairs  # they are no longer on the GPU
+        out.backward(grad_out)
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+        torch.testing.assert_close(x.grad, ref_grad, rtol=0, atol=0)
+    finally:
+        OFFLOADER.armed = False

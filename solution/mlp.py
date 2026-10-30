@@ -15,6 +15,7 @@ value cast to fp32 and back is unchanged, so only the copies go away, not precis
 
 import torch
 
+from .offload import swiglu_maybe_offloaded
 from .swiglu import swiglu  # the example's SwiGLU kernel; it does not count as ours
 
 
@@ -38,7 +39,8 @@ def patch_qwen2_mlp_fp16():
             return original(self, x)
         gate = self.gate_proj(x.to(torch.float16))
         up = self.up_proj(x.to(torch.float16))
-        return self.down_proj(swiglu(gate, up))
+        # in training, gate and up wait for the backward pass in host memory (offload.py)
+        return self.down_proj(swiglu_maybe_offloaded(gate, up, swiglu))
 
     forward._kc_patched = True
     cls.forward = forward

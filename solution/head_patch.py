@@ -19,7 +19,7 @@ import types
 import torch
 from torch.nn import functional
 
-from . import warmup
+from . import offload, warmup
 from .fused_ce import IGNORE_INDEX, fused_lm_head_ce
 
 STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR, read by rewind
@@ -141,6 +141,9 @@ def patch_sft_trainer():
                             num_items_in_batch=num_items_in_batch)
 
         warmup.wait()  # the background compilation (warmup.py) is done before the first step
+        max_tokens = (getattr(self.args, "per_device_train_batch_size", 0) or 0) * \
+            (getattr(self.args, "max_length", 0) or 0) or inputs["input_ids"].numel()
+        offload.OFFLOADER.new_step(offload.arena_bytes(lm.config, max_tokens))
         mode = "train"
         inputs.pop("_prediction_loss_only", None)  # as TRL does before it delegates
         inputs["use_cache"] = False
@@ -196,6 +199,17 @@ def _fp16_tied_embedding(model):
     embed.register_forward_hook(lambda module, args, output: output.float())
 
 
+def _start_pinning(model, cfg=None, tcfg=None, *_):
+    """Pin the offload arena (offload.py) in the background while Soup builds the trainer."""
+    lm = _causal_lm(model)
+    try:
+        max_tokens = int(tcfg.batch_size) * int(cfg.data.max_length)
+    except Exception:  # noqa: BLE001 - unknown config: the first step reserves it instead
+        return
+    if lm is not None and lm.lm_head.weight.is_cuda:
+        offload.OFFLOADER.reserve_in_background(offload.arena_bytes(lm.config, max_tokens))
+
+
 def patch_soup_setup():
     """Runs `_fp16_tied_embedding` when Soup has built the final 4-bit PEFT model."""
     from soup_cli.trainer import sft
@@ -210,6 +224,7 @@ def patch_soup_setup():
         model = getattr(self, "model", None)
         if isinstance(model, torch.nn.Module):
             _fp16_tied_embedding(model)
+            _start_pinning(model, *args)
         return result
 
     _setup_transformers._kc_patched = True
