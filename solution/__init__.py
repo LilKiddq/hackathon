@@ -13,6 +13,7 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .add_rmsnorm import patch_qwen2_add_rmsnorm
 from .head_patch import patch_causal_lm, patch_sft_trainer, patch_soup_setup
 from .mlp import patch_qwen2_mlp_fp16
 from .nf4 import patch_bnb_matmul_4bit
@@ -25,6 +26,7 @@ def apply():
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
     patch_qwen2_mlp_fp16()  # the MLP around it on the fp16 path: half the saved activations
     patch_qwen2_rmsnorm()  # ours: fused RMSNorm forward + backward
+    patch_qwen2_add_rmsnorm()  # ours: residual add + post-attention RMSNorm in one kernel
     patch_qwen2_rope()  # ours: fused rotary embedding for q and k, forward + backward
     patch_causal_lm()  # ours: lm_head + cross-entropy + entropy/accuracy without full logits
     patch_sft_trainer()  # logs TRL's metrics and Soup's rewind losses from the fused step

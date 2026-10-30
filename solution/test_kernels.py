@@ -175,3 +175,29 @@ def test_rope_cpu_fallback(dtype, unsqueeze_dim):
     grads = torch.autograd.grad(out, (q, k, cos, sin), grad)
     for actual, expected in zip(grads, ref_grads):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("delta_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("shape", [(4, 512, 1536), (3, 77, 1000)])
+def test_add_rmsnorm_matches_pytorch(delta_dtype, shape):
+    from solution.add_rmsnorm import AddRMSNorm
+
+    torch.manual_seed(0)
+    residual = torch.randn(shape, device="cuda", requires_grad=True)
+    delta = torch.randn(shape, device="cuda").to(delta_dtype).requires_grad_()
+    weight = torch.rand(shape[-1], device="cuda") + 0.5
+    grad_s, grad_y = torch.randn(shape, device="cuda"), torch.randn(shape, device="cuda")
+
+    s = residual + delta
+    y = weight * (s * torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + 1e-6))
+    torch.autograd.backward((s, y), (grad_s, grad_y))
+    ref_dr, ref_dd = residual.grad, delta.grad
+    residual.grad = delta.grad = None
+
+    s2, y2 = AddRMSNorm.apply(residual, delta, weight, 1e-6)
+    torch.autograd.backward((s2, y2), (grad_s, grad_y))
+    tol = TOLERANCE[delta_dtype]
+    torch.testing.assert_close(s2, s, rtol=0, atol=0)
+    torch.testing.assert_close(y2, y, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(residual.grad, ref_dr, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(delta.grad, ref_dd, rtol=tol, atol=tol)
