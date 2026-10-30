@@ -168,3 +168,47 @@ def patch_sft_trainer():
 
     compute_loss._kc_patched = True
     cls.compute_loss = compute_loss
+
+
+def _fp16_tied_embedding(model):
+    """Keep the tied embedding / lm_head weight in fp16 instead of fp32.
+
+    prepare_model_for_kbit_training upcasts it to fp32: 151936 x 1536 x 4 bytes = 933 MB, and
+    the head still needs an fp16 copy for its matmul. Qwen2.5's checkpoint stores it in bf16,
+    and every bf16 value in fp16's normal range is exact in fp16, so the fp16 tensor holds the
+    same numbers (the head used fp16 under autocast anyway). The embedding output is widened back
+    to fp32 by a forward hook, so the residual stream and everything after it see fp32 as before.
+    """
+    lm = _causal_lm(model)
+    if lm is None:
+        return
+    embed, head = lm.get_input_embeddings(), lm.lm_head
+    weight = embed.weight
+    if (weight is not head.weight or weight.dtype != torch.float32 or not weight.is_cuda
+            or weight.requires_grad):
+        return
+    half = torch.nn.Parameter(weight.detach().to(torch.float16), requires_grad=False)
+    embed.weight = half
+    head.weight = half
+    del weight
+    embed.register_forward_hook(lambda module, args, output: output.float())
+
+
+def patch_soup_setup():
+    """Runs `_fp16_tied_embedding` when Soup has built the final 4-bit PEFT model."""
+    from soup_cli.trainer import sft
+
+    cls = sft.SFTTrainerWrapper
+    if getattr(cls._setup_transformers, "_kc_patched", False):
+        return
+    original = cls._setup_transformers
+
+    def _setup_transformers(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        model = getattr(self, "model", None)
+        if isinstance(model, torch.nn.Module):
+            _fp16_tied_embedding(model)
+        return result
+
+    _setup_transformers._kc_patched = True
+    cls._setup_transformers = _setup_transformers

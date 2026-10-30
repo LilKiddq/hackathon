@@ -13,7 +13,7 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
-from .head_patch import patch_causal_lm, patch_sft_trainer
+from .head_patch import patch_causal_lm, patch_sft_trainer, patch_soup_setup
 from .mlp import patch_qwen2_mlp_fp16
 from .nf4 import patch_bnb_matmul_4bit
 from .rmsnorm import patch_qwen2_rmsnorm
@@ -28,4 +28,5 @@ def apply():
     patch_qwen2_rope()  # ours: fused rotary embedding for q and k, forward + backward
     patch_causal_lm()  # ours: lm_head + cross-entropy + entropy/accuracy without full logits
     patch_sft_trainer()  # logs TRL's metrics and Soup's rewind losses from the fused step
+    patch_soup_setup()  # tied embedding / lm_head kept in fp16 (same values), -933 MB
     patch_bnb_matmul_4bit()  # ours: one-launch NF4 dequantization for every 4-bit layer

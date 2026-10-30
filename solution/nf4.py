@@ -99,23 +99,24 @@ class NF4Linear(torch.autograd.Function):
     """x @ dequant(W).T for a frozen NF4 weight; the weight is dequantized again for backward."""
 
     @staticmethod
-    def forward(ctx, x, packed, quant_state):
+    def forward(ctx, x, packed, quant_state, bias=None):
         weight = dequantize_nf4(packed, quant_state, x.dtype)
         ctx.quant_state = quant_state
         ctx.save_for_backward(packed)
-        return torch.nn.functional.linear(x, weight)
+        return torch.nn.functional.linear(x, weight, bias)
 
     @staticmethod
     def backward(ctx, grad):
         (packed,) = ctx.saved_tensors
         weight = dequantize_nf4(packed, ctx.quant_state, grad.dtype)
-        return grad @ weight, None, None
+        return grad @ weight, None, None, None
 
 
 def patch_bnb_matmul_4bit():
     """`bnb.nn.Linear4bit.forward` calls `bnb.matmul_4bit`, looked up at call time. Training
-    calls with an fp16 input that needs a gradient go through NF4Linear; everything else (eval,
-    generation, bias, other formats) keeps bitsandbytes' own path."""
+    calls with an fp16 input that needs a gradient go through NF4Linear (a frozen bias, as
+    q/k/v_proj have, is added by the same F.linear bitsandbytes uses); everything else (eval,
+    generation, a trainable bias, other formats) keeps bitsandbytes' own path."""
     import bitsandbytes
 
     if getattr(bitsandbytes.matmul_4bit, "_kc_patched", False):
@@ -123,10 +124,11 @@ def patch_bnb_matmul_4bit():
     original = bitsandbytes.matmul_4bit
 
     def matmul_4bit(A, B, quant_state, out=None, bias=None):
-        if (out is None and bias is None and A.is_cuda and A.dtype == torch.float16
+        if (out is None and A.is_cuda and A.dtype == torch.float16
+                and (bias is None or (not bias.requires_grad and bias.dtype == A.dtype))
                 and torch.is_grad_enabled() and A.requires_grad and A.numel() > 0
                 and supported(quant_state) and A.shape[-1] == quant_state.shape[1]):
-            return NF4Linear.apply(A, B, quant_state)
+            return NF4Linear.apply(A, B, quant_state, bias)
         return original(A, B, quant_state, out=out, bias=bias)
 
     matmul_4bit._kc_patched = True
