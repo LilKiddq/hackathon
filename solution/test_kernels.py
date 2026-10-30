@@ -286,9 +286,10 @@ def test_offloaded_swiglu_without_synchronization():
 
     torch.manual_seed(1)
     layers, tokens, width, inter = 8, 517, 256, 2048
-    weights = [((torch.randn(width, inter, device="cuda") * 0.05).half(),
-                (torch.randn(width, inter, device="cuda") * 0.05).half(),
-                (torch.randn(inter, width, device="cuda") * 0.05).half()) for _ in range(layers)]
+    # small weights: SwiGLU grows like h^2, and 8 layers of 0.05 overflow fp16 to inf/NaN
+    weights = [((torch.randn(width, inter, device="cuda") * 0.01).half(),
+                (torch.randn(width, inter, device="cuda") * 0.01).half(),
+                (torch.randn(inter, width, device="cuda") * 0.01).half()) for _ in range(layers)]
     x0 = torch.randn(tokens, width, device="cuda", dtype=torch.float16)
     grad_out = torch.randn(tokens, width, device="cuda", dtype=torch.float16)
 
@@ -301,6 +302,7 @@ def test_offloaded_swiglu_without_synchronization():
         return h.detach(), x.grad
 
     ref, ref_grad = run(swiglu)
+    assert torch.isfinite(ref).all() and torch.isfinite(ref_grad).all()
     config = type("Config", (), {"num_hidden_layers": layers, "intermediate_size": inter})()
     try:
         for _ in range(3):  # several steps reuse the same host arena
