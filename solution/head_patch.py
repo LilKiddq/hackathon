@@ -19,6 +19,7 @@ import types
 import torch
 from torch.nn import functional
 
+from . import warmup
 from .fused_ce import IGNORE_INDEX, fused_lm_head_ce
 
 STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR, read by rewind
@@ -139,6 +140,7 @@ def patch_sft_trainer():
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)
 
+        warmup.wait()  # the background compilation (warmup.py) is done before the first step
         mode = "train"
         inputs.pop("_prediction_loss_only", None)  # as TRL does before it delegates
         inputs["use_cache"] = False

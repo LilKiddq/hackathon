@@ -20,6 +20,7 @@ from .nf4 import patch_bnb_matmul_4bit
 from .rmsnorm import patch_qwen2_rmsnorm
 from .rope import patch_qwen2_rope
 from .swiglu import patch_qwen2_mlp
+from .warmup import start as start_kernel_warmup
 
 
 def apply():
@@ -32,3 +33,4 @@ def apply():
     patch_sft_trainer()  # logs TRL's metrics and Soup's rewind losses from the fused step
     patch_soup_setup()  # tied embedding / lm_head kept in fp16 (same values), -933 MB
     patch_bnb_matmul_4bit()  # ours: one-launch NF4 dequantization for every 4-bit layer
+    start_kernel_warmup()  # compile the kernels in the background while Soup loads the model
