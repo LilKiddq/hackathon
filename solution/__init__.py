@@ -20,6 +20,7 @@ from .nf4 import patch_bnb_matmul_4bit
 from .rmsnorm import patch_qwen2_rmsnorm
 from .rope import patch_qwen2_rope
 from .swiglu import patch_qwen2_mlp
+from .unpad import patch_qwen2_unpad
 from .warmup import start as start_kernel_warmup
 
 
@@ -28,6 +29,7 @@ def apply():
     patch_qwen2_mlp_fp16()  # the MLP around it on the fp16 path: half the saved activations
     patch_qwen2_rmsnorm()  # ours: fused RMSNorm forward + backward
     patch_qwen2_add_rmsnorm()  # ours: residual add + post-attention RMSNorm in one kernel
+    patch_qwen2_unpad()  # decoder layers on real tokens only (after add_rmsnorm: wraps its layer)
     patch_qwen2_rope()  # ours: fused rotary embedding for q and k, forward + backward
     patch_causal_lm()  # ours: lm_head + cross-entropy + entropy/accuracy without full logits
     patch_sft_trainer()  # logs TRL's metrics and Soup's rewind losses from the fused step
