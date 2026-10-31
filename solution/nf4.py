@@ -112,10 +112,9 @@ class UnitMeta:
         self.code2 = first.state2.code
         nbytes = [state.shape[0] * state.shape[1] // 2 for state in states]
         self.n_bytes = starts[-1] + nbytes[-1]
-        members = []
-        for number, (start, size) in enumerate(zip(starts, nbytes)):
-            members += [number] * (size // UNIT_BLOCK_BYTES)
-        self.member = torch.tensor(members, dtype=torch.int32, device=device)
+        counts = torch.tensor([size // UNIT_BLOCK_BYTES for size in nbytes], device=device)
+        self.member = torch.repeat_interleave(
+            torch.arange(len(nbytes), dtype=torch.int32, device=device), counts)
         self.start = torch.tensor(starts, dtype=torch.int64, device=device)
         a8 = [state.absmax.numel() for state in states]
         a2 = [state.state2.absmax.numel() for state in states]
