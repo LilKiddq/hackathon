@@ -31,6 +31,8 @@ from .swiglu import BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 
 MAX_IN_FLIGHT_BYTES = 128 << 20  # transfers the CPU lets run ahead before it waits for the oldest
 RELEASE_WAIT_BYTES = 48 << 20  # before the head, the CPU waits only above this much in flight
+EXTRA_CHUNK_BYTES = 256 << 20  # pinned on demand when a step needs more than the arena
+ARENA_FILL = 0.65  # the arena covers this share of the worst case (measured need: ~0.6)
 SAVED_MIN_BYTES = 256 << 10  # smaller saved tensors stay on the GPU (not worth a transfer)
 SAVED_PER_HIDDEN = 16  # arena estimate: bytes per token and hidden unit a layer saves
 # (measured ~12.5: norms 2 x 2, LoRA inputs 2 x 2, masks 2 x 1, attention q + grouped k/v ~2.7)
@@ -80,6 +82,8 @@ class Offloader:
         self.pending_entry = None
         self._reserving = None
         self.peak_cursor = 0
+        self.extra = []  # pinned chunks beyond the arena, made on demand
+        self.extra_cursor = []
         self.kept_on_gpu = 0
 
     def reserve(self, nbytes):
@@ -115,8 +119,9 @@ class Offloader:
             self._reserving = None
         if self.stream is not None:
             self.stream.synchronize()
-        self.peak_cursor = max(self.peak_cursor, self.cursor)
+        self.peak_cursor = max(self.peak_cursor, self.cursor + sum(self.extra_cursor))
         self.entries, self.groups, self.in_flight, self.cursor = [], {}, [], 0
+        self.extra_cursor = [0] * len(self.extra)
         self.in_flight_bytes, self.layer, self.seen = 0, None, {}
         self.pending, self.pending_entry = [], None
         if nbytes:
@@ -136,10 +141,27 @@ class Offloader:
 
     def _host(self, nbytes):
         start = -(-self.cursor // ALIGN) * ALIGN
-        if self.arena is None or start + nbytes > self.arena.numel():
+        if self.arena is not None and start + nbytes <= self.arena.numel():
+            self.cursor = start + nbytes
+            return self.arena[start:start + nbytes]
+        return self._extra_host(nbytes) if self.arena is not None else None
+
+    def _extra_host(self, nbytes):
+        """Past the arena (a longer batch than it was sized for): pinned chunks pinned on
+        demand and kept for later steps, so nothing has to stay on the GPU."""
+        for index, chunk in enumerate(self.extra):
+            start = -(-self.extra_cursor[index] // ALIGN) * ALIGN
+            if start + nbytes <= chunk.numel():
+                self.extra_cursor[index] = start + nbytes
+                return chunk[start:start + nbytes]
+        try:
+            chunk = torch.empty(max(nbytes, EXTRA_CHUNK_BYTES), dtype=torch.uint8,
+                                pin_memory=True)
+        except Exception:  # noqa: BLE001 - no more pinned memory: this one stays on the GPU
             return None
-        self.cursor = start + nbytes
-        return self.arena[start:start + nbytes]
+        self.extra.append(chunk)
+        self.extra_cursor.append(nbytes)
+        return chunk[:nbytes]
 
     def _new_entry(self, tensors, group):
         entry = _Entry()
@@ -350,7 +372,10 @@ def arena_bytes(config, max_tokens, mlp_pairs=True):
     if not layers or not inter or not max_tokens:
         return 0
     per_token = (SAVED_PER_HIDDEN + 2) * hidden + (2 * inter * 2 if mlp_pairs else 0)
-    return layers * (max_tokens * per_token + 32 * ALIGN)
+    # pinning costs ~0.7 s per GB in the measured run, so the arena is sized for what the
+    # longest batches actually save (ARENA_FILL of this estimate for batch x max_length tokens),
+    # and a longer batch takes extra pinned chunks on demand (_extra_host)
+    return int(ARENA_FILL * layers * (max_tokens * per_token + 32 * ALIGN))
 
 
 def _report():
@@ -359,7 +384,8 @@ def _report():
 
         arena = OFFLOADER.arena.numel() if OFFLOADER.arena is not None else 0
         print(f"[solution] offload: peak host use {max(OFFLOADER.peak_cursor, OFFLOADER.cursor) >> 20}"
-              f" MiB of {arena >> 20} MiB, entries kept on GPU {OFFLOADER.kept_on_gpu}",
+              f" MiB of {arena >> 20} MiB (+{sum(c.numel() for c in OFFLOADER.extra) >> 20} MiB"
+              f" pinned on demand), entries kept on GPU {OFFLOADER.kept_on_gpu}",
               file=sys.stderr)
 
 
