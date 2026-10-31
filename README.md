@@ -53,8 +53,12 @@ RoPE также отключает FMA и сохраняет промежуто�
 ## Как запустить
 
 Импортировать templates/kaggle_notebook.ipynb в Kaggle; GPU T4 x2, Internet On.
-Используется одна карта. REPO_URL = https://github.com/LilKiddq/hackathon.git — публичное зеркало репозитория
-команды https://github.com/BAITC-Hacks/hack-0e0f2cfa-kuchbrtna с теми же коммитами (Kaggle клонирует без токена).
+Используется одна карта. REPO_URL = https://github.com/BAITC-Hacks/hack-0e0f2cfa-kuchbrtna.git (репозиторий команды,
+клонируется с Kaggle-секретом `GITHUB_TOKEN`).
+
+Где шла разработка: приглашение в выданный организаторами репозиторий команда приняла только 31 октября; до этого
+вся работа велась в https://github.com/LilKiddq/hackathon. 31 октября вся история перенесена сюда целиком — все
+коммиты с исходными датами, авторами и сообщениями, без переписывания; дальше работа идёт только здесь.
 Финальный коммит и ссылка на публичный Kaggle-ноутбук — в [SUBMISSION.md](SUBMISSION.md).
 
 ```bash
