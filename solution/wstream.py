@@ -290,6 +290,7 @@ def weights_to_host_while_loading():
       the GPU, so the packed weights never sit on the GPU together;
     - the tied embedding (fp16, 467 MB) is loaded into host memory instead of the GPU; it becomes
       the int8 host table at the end of setup (head8.py), passing through the GPU in slices;
+    - checkpoint tensors headed for the GPU are converted (bf16 -> fp16) on the GPU;
     - transformers' caching-allocator warm-up is skipped: it allocates (and the allocator then
       keeps) one block the size of the whole model up front, only to make the later per-weight
       allocations faster. Here those weights do not stay on the GPU, so the block would only be
@@ -331,6 +332,23 @@ def weights_to_host_while_loading():
                 return _get_device
 
             stack.enter_context(_patched(core_model_loading, "get_device", get_device))
+
+            def materialize(original):
+                def _materialize_copy(tensor, device=None, dtype=None):
+                    # a bf16 checkpoint tensor headed for the GPU in fp16 goes over as it is and
+                    # is converted there: the same rounding (round to nearest even) as on the
+                    # CPU, where torch would otherwise convert 3 GB on a few cores first
+                    tensor = tensor[...]
+                    if (device is not None and dtype is not None and _is_gpu(device)
+                            and tensor.device.type == "cpu" and tensor.dtype != dtype
+                            and tensor.is_floating_point()):
+                        return tensor.to(device=device).to(dtype=dtype)
+                    if device is not None or dtype is not None:
+                        tensor = tensor.to(device=device, dtype=dtype)
+                    return tensor
+                return _materialize_copy
+
+            stack.enter_context(_patched(core_model_loading, "_materialize_copy", materialize))
             stack.enter_context(_patched(modeling_utils, "caching_allocator_warmup",
                                          lambda original: lambda *args, **kwargs: None))
         except Exception:  # noqa: BLE001 - another transformers: the usual loading

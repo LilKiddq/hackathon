@@ -30,6 +30,7 @@ import triton
 from .swiglu import BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 
 MAX_IN_FLIGHT_BYTES = 128 << 20  # transfers the CPU lets run ahead before it waits for the oldest
+RELEASE_WAIT_BYTES = 48 << 20  # before the head, the CPU waits only above this much in flight
 SAVED_MIN_BYTES = 256 << 10  # smaller saved tensors stay on the GPU (not worth a transfer)
 SAVED_PER_HIDDEN = 16  # arena estimate: bytes per token and hidden unit a layer saves
 # (measured ~12.5: norms 2 x 2, LoRA inputs 2 x 2, masks 2 x 1, attention q + grouped k/v ~2.7)
@@ -215,13 +216,29 @@ class Offloader:
         self.in_flight = waiting
 
     def release_all(self):
-        """Wait for the transfers still in flight and drop their GPU tensors. Called before the
-        head, whose logits chunk would otherwise sit next to the last layers' tensors."""
+        """Before the head: the last layer's tensors start their copy, and the GPU tensors of
+        finished copies are dropped. The CPU waits only while more than RELEASE_WAIT_BYTES are
+        still in flight (the head's buffers would sit next to them); otherwise the head is queued
+        at once and the GPU never idles here. What remains is dropped when the backward starts."""
         self.flush()
-        for entry in self.in_flight:
+        self._retire()
+        while self.in_flight and self.in_flight_bytes > RELEASE_WAIT_BYTES:
+            entry = self.in_flight.pop(0)
             entry.copied.synchronize()
             entry.gpu = None
-        self.in_flight, self.in_flight_bytes = [], 0
+            self.in_flight_bytes -= entry.nbytes
+
+    def _retire_all_done(self):
+        """Drop the GPU tensors of every finished copy (no waiting); the rest wait on events."""
+        if self.in_flight:
+            waiting = []
+            for entry in self.in_flight:
+                if entry.copied.query():
+                    entry.gpu = None
+                    self.in_flight_bytes -= entry.nbytes
+                else:
+                    waiting.append(entry)
+            self.in_flight = waiting
 
     def _fetch_group(self, group):
         for entry in self.groups.get(group, ()):
@@ -229,7 +246,9 @@ class Offloader:
                 self._fetch(entry)
 
     def prefetch_last(self):
-        """Start copying the last group back: it is the first one the backward pass needs."""
+        """Start copying the last group back: it is the first one the backward pass needs.
+        (The forward's last copies are done by now: their GPU tensors go.)"""
+        self._retire_all_done()
         if self.entries:
             self._fetch_group(self.entries[-1].group)
 

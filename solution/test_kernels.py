@@ -373,7 +373,8 @@ def test_saved_tensor_offload_matches_and_frees_gpu_memory():
             x, out = run(True)
             OFFLOADER.release_all()
             torch.cuda.synchronize()
-            torch.empty(1, device="cuda")  # the allocator frees the copied tensors on its next call
+            OFFLOADER._retire_all_done()  # as at the start of the backward pass (prefetch_last)
+            torch.empty(1, device="cuda")
             assert OFFLOADER.entries and all(e.host is not None for e in OFFLOADER.entries)
             assert torch.cuda.memory_allocated() - before < kept_plain * 0.75
             OFFLOADER.prefetch_last()
