@@ -19,12 +19,14 @@ from .mlp import patch_qwen2_mlp_fp16
 from .nf4 import patch_bnb_matmul_4bit
 from .rmsnorm import patch_qwen2_rmsnorm
 from .rope import patch_qwen2_rope
+from .startup import patch_soup_row_mapping
 from .swiglu import patch_qwen2_mlp
 from .unpad import patch_qwen2_unpad
 from .warmup import start as start_kernel_warmup
 
 
 def apply():
+    patch_soup_row_mapping()  # Soup's dataset map with a given fingerprint: no 2 s dill hash
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
     patch_qwen2_mlp_fp16()  # the MLP around it on the fp16 path: half the saved activations
     patch_qwen2_rmsnorm()  # ours: fused RMSNorm forward + backward
