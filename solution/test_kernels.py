@@ -350,12 +350,16 @@ def test_saved_tensor_offload_matches_and_frees_gpu_memory():
                 OFFLOADER.layer = index
                 with torch.autograd.graph.saved_tensors_hooks(OFFLOADER.pack, OFFLOADER.unpack):
                     h = layer(h, w)
+                OFFLOADER.flush()  # as the decoder-layer patch does when a layer ends
                 OFFLOADER.layer = None
             else:
                 h = layer(h, w)
         return x, h
 
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
     x, ref = run(False)
+    kept_plain = torch.cuda.memory_allocated() - before
     ref.backward(grad_out)
     ref_grad = x.grad
     del x
@@ -367,7 +371,7 @@ def test_saved_tensor_offload_matches_and_frees_gpu_memory():
             x, out = run(True)
             OFFLOADER.release_all()
             assert OFFLOADER.entries and all(e.host is not None for e in OFFLOADER.entries)
-            assert torch.cuda.memory_allocated() - before < 8 * tokens * width * 4
+            assert torch.cuda.memory_allocated() - before < kept_plain / 2
             OFFLOADER.prefetch_last()
             out.backward(grad_out)
             torch.testing.assert_close(out, ref, rtol=0, atol=0)
