@@ -22,6 +22,7 @@ from torch.nn import functional
 from . import offload, warmup
 from .wstream import STREAMER
 from .fused_ce import IGNORE_INDEX, fused_lm_head_ce
+from .head8 import Int8Embedding, dequant_rows, fused_int8_head_ce, quantize_rows
 
 STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR, read by rewind
 
@@ -68,9 +69,15 @@ def _fused_forward(self, original, input_ids=None, attention_mask=None, position
         denominator = torch.tensor(num_items_in_batch, device=hidden.device)
 
     offload.OFFLOADER.release_all()  # the last layers' MLP pairs leave the GPU before the head
-    loss, row_loss, row_entropy, row_hit = fused_lm_head_ce(
-        hidden.reshape(-1, width).index_select(0, rows), _fp16_weight(self.lm_head),
-        flat_target.index_select(0, rows), denominator.float())
+    int8 = getattr(self, "_kc_int8", None)
+    if int8 is not None:  # the tied weight held as int8 rows (head8.py)
+        loss, row_loss, row_entropy, row_hit = fused_int8_head_ce(
+            hidden.reshape(-1, width).index_select(0, rows), int8[0], int8[1],
+            flat_target.index_select(0, rows), denominator.float())
+    else:
+        loss, row_loss, row_entropy, row_hit = fused_lm_head_ce(
+            hidden.reshape(-1, width).index_select(0, rows), _fp16_weight(self.lm_head),
+            flat_target.index_select(0, rows), denominator.float())
     offload.OFFLOADER.prefetch_last()  # and the last one comes back while the backward starts
     STREAMER.prefetch_backward()  # as do the last layer's weights
 
@@ -218,6 +225,39 @@ def _fp16_tied_embedding(model):
     lm.get_input_embeddings().register_forward_hook(lambda module, args, output: output.float())
 
 
+def _int8_tied_embedding(model):
+    """Replace the fp16 tied embedding / lm_head weight by int8 rows + scales (head8.py).
+
+    The embedding looks up and dequantizes its rows; the fused head reads the int8 table. The
+    modules keep a `weight` of the right shape and dtype (one fp16 zero, expanded: 2 bytes), and
+    any other call of the head (not training's fused step) dequantizes the table in full."""
+    lm = _causal_lm(model)
+    if lm is None:
+        return
+    weight = _tied_embedding(lm)
+    if weight is None or weight.dtype != torch.float16 or weight.requires_grad \
+            or weight.dim() != 2:
+        return
+    embed, head = lm.get_input_embeddings(), lm.lm_head
+    q, scale = quantize_rows(weight.detach())
+    stand_in = torch.nn.Parameter(weight.new_zeros((1, 1)).expand(weight.shape),
+                                  requires_grad=False)
+    embed.weight = stand_in
+    head.weight = stand_in
+    del weight
+    lm._kc_int8 = (q, scale)
+
+    def embed_forward(ids):
+        return Int8Embedding.apply(ids, q, scale)
+
+    def head_forward(hidden):
+        return functional.linear(hidden.to(torch.float16), dequant_rows(q, scale))
+
+    embed.forward = embed_forward
+    head.forward = head_forward
+    torch.cuda.empty_cache()
+
+
 def patch_kbit_preparation():
     """peft's prepare_model_for_kbit_training without the fp32 copy of the tied embedding.
 
@@ -305,6 +345,7 @@ def patch_soup_setup():
         model = getattr(self, "model", None)
         if isinstance(model, torch.nn.Module):
             _fp16_tied_embedding(model)
+            _int8_tied_embedding(model)
         return result
 
     _setup_transformers._kc_patched = True

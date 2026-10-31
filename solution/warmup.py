@@ -62,6 +62,15 @@ def _compile_all():
     loss = fused_lm_head_ce(head_in, head, target, (target != -100).sum().float())[0]
     loss.backward()
 
+    from .head8 import TILE_V, Int8Embedding, fused_int8_head_ce, quantize_rows
+
+    q8, s8 = quantize_rows(randn(TILE_V + 4480, width, dtype=torch.float16))  # 151936's tiles
+    Int8Embedding.apply(torch.zeros(2, 3, dtype=torch.long, device=device), q8, s8)
+    head_in = randn(rows, width).requires_grad_()
+    target = torch.randint(0, TILE_V + 4480, (rows,), device=device, generator=gen)
+    target[::2] = -100
+    fused_int8_head_ce(head_in, q8, s8, target, (target != -100).sum().float())[0].backward()
+
     state2 = types.SimpleNamespace(code=torch.linspace(-1, 1, 256, device=device),
                                    absmax=torch.ones(1, device=device), blocksize=256)
     state = types.SimpleNamespace(shape=(32, 64), blocksize=64, state2=state2,
