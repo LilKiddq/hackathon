@@ -339,7 +339,7 @@ class Offloader:
 OFFLOADER = Offloader()
 
 
-def arena_bytes(config, max_tokens, mlp_pairs=False):
+def arena_bytes(config, max_tokens, mlp_pairs=True):
     """Host memory for one step, for max_tokens tokens: what a decoder layer saves for its
     backward pass (fp16 norm inputs, fp16 LoRA inputs and their dropout masks, q and the grouped
     k/v, the MLP's fp16 input: about 14.5 x hidden bytes per token, 18 with headroom), plus gate

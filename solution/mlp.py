@@ -39,8 +39,7 @@ class FusedMLP(torch.autograd.Function):
 
     The same kernels and matmuls as the module path (NF4 dequantization, cuBLAS, the example's
     SwiGLU kernels), so the same numbers: x is cast to fp16 once (each 4-bit layer cast it on its
-    own), and only that fp16 input is kept for the backward pass (offloaded with the layer,
-    offload.py), which recomputes gate and up from it.
+    own), and gate and up are kept for the backward pass (offloaded with the layer, offload.py).
     One Python node instead of three Linear4bit -> matmul_4bit -> NF4Linear chains, a SwiGLU node
     and two casts, both ways: the step is limited by the CPU launching work, not by the GPU."""
 
@@ -53,32 +52,25 @@ class FusedMLP(torch.autograd.Function):
         act = torch.empty_like(gate)
         n = gate.numel()
         example_swiglu_fwd_kernel[(triton.cdiv(n, BLOCK),)](gate, up, act, n, BLOCK=BLOCK)
-        del gate, up
         out = torch.nn.functional.linear(act, _weight(down_proj))
-        # only the fp16 input is kept (3 KB per token instead of gate and up, 35.8 KB): the
-        # backward pass recomputes gate and up with the same matmuls (the same numbers), which
-        # costs two matmuls there but saves two thirds of the bytes offloaded through PCIe
-        ctx.save_for_backward(flat)
+        ctx.save_for_backward(gate, up)
         ctx.modules, ctx.x_dtype, ctx.x_shape = (gate_proj, up_proj, down_proj), x.dtype, x.shape
         return out.view(*x.shape[:-1], out.shape[-1])
 
     @staticmethod
     def backward(ctx, grad):
-        (x16,) = ctx.saved_tensors
+        gate, up = ctx.saved_tensors
         gate_proj, up_proj, down_proj = ctx.modules
         flat = grad.reshape(-1, grad.shape[-1]).to(torch.float16)
         dact = flat @ _weight(down_proj)  # backward order: down, up, gate (wstream's window)
-        w_up, w_gate = _weight(up_proj), _weight(gate_proj)
-        up = torch.nn.functional.linear(x16, w_up)  # recomputed: the forward's exact values
-        gate = torch.nn.functional.linear(x16, w_gate)
         dgate, dup = torch.empty_like(gate), torch.empty_like(up)
         n = gate.numel()
         example_swiglu_bwd_kernel[(triton.cdiv(n, BLOCK),)](dact, gate, up, dgate, dup, n,
                                                            BLOCK=BLOCK)
-        del dact, gate, up
+        del dact
         # as the module path: each input gradient in fp16, the two summed in x's dtype
-        dx = (dup @ w_up).to(ctx.x_dtype)
-        dx.add_(dgate @ w_gate)
+        dx = (dup @ _weight(up_proj)).to(ctx.x_dtype)
+        dx.add_(dgate @ _weight(gate_proj))
         return dx.view(ctx.x_shape), None, None, None
 
 
