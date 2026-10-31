@@ -41,7 +41,7 @@ def int8_rows_dequant_kernel(q_ptr, scale_ptr, out_ptr, H, BLOCK_H: tl.constexpr
     tl.store(out_ptr + row * H + cols, (q * scale).to(tl.float16), mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["tile_start", "tile_index", "n_tiles", "TV"])
 def head_partial_kernel(logits_ptr, stride, target_ptr, part_ptr, best_idx_ptr, target_logit_ptr,
                         tile_start, tile_index, n_tiles, TV, BLOCK_V: tl.constexpr,
                         NEG: tl.constexpr):
@@ -86,7 +86,7 @@ def head_partial_kernel(logits_ptr, stride, target_ptr, part_ptr, best_idx_ptr, 
         tl.store(target_logit_ptr + row, tl.load(row_ptr + local).to(tl.float32))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["tile_start", "TV"])
 def head_grad_kernel(logits_ptr, stride, target_ptr, lse_ptr, coef_ptr, tile_start, TV,
                      BLOCK_V: tl.constexpr):
     """In place, one program per labelled row: coef * (exp(x - lse) - onehot(target)), fp16."""

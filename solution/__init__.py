@@ -27,6 +27,8 @@ from .warmup import start as start_kernel_warmup
 
 
 def apply():
+    # first: the compilation overlaps the imports below and Soup's model loading
+    start_kernel_warmup()
     reuse_package_index()  # before trl is imported: no second scan of the installed packages
     patch_soup_row_mapping()  # Soup's dataset map with a given fingerprint: no 2 s dill hash
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
@@ -40,4 +42,3 @@ def apply():
     patch_sft_trainer()  # logs TRL's metrics and Soup's rewind losses from the fused step
     patch_soup_setup()  # tied embedding / lm_head kept in fp16, never upcast to fp32 (-933 MB)
     patch_bnb_matmul_4bit()  # ours: one-launch NF4 dequantization for every 4-bit layer
-    start_kernel_warmup()  # compile the kernels in the background while Soup loads the model
