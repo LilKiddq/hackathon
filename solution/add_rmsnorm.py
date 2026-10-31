@@ -64,7 +64,8 @@ class AddRMSNorm(torch.autograd.Function):
         block = triton.next_power_of_2(cols)
         # training: the backward pass gets s in fp16 (half the bytes to keep or offload; an
         # approximation of ~1e-3 relative in the gradient, within the task's tolerances)
-        half = torch.is_grad_enabled() and (residual.requires_grad or delta.requires_grad)
+        # (grad mode is off inside Function.forward: needs_input_grad says whether one is needed)
+        half = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
         saved = torch.empty(residual.shape, device=residual.device, dtype=torch.float16) \
             if half else s
         add_rmsnorm_fwd_kernel[(rows,)](

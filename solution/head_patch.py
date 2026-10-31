@@ -405,3 +405,34 @@ def patch_soup_setup():
 
     _setup_transformers._kc_patched = True
     cls._setup_transformers = _setup_transformers
+
+    # where the allocator's peak grows between setup and the first step (report only)
+    setup = cls.setup
+
+    def setup_with_note(self, *args, **kwargs):
+        result = setup(self, *args, **kwargs)
+        _note_peak("trainer built")
+        return result
+
+    cls.setup = setup_with_note
+    try:
+        import transformers
+
+        trainer_cls = transformers.Trainer
+        if not getattr(trainer_cls.training_step, "_kc_noted", False):
+            training_step = trainer_cls.training_step
+            inner_loop = trainer_cls._inner_training_loop
+
+            def training_step_with_note(self, *args, **kwargs):
+                _note_peak(f"step {_STEP[0] + 1} before compute_loss")
+                return training_step(self, *args, **kwargs)
+
+            def inner_loop_with_note(self, *args, **kwargs):
+                _note_peak("train() start")
+                return inner_loop(self, *args, **kwargs)
+
+            training_step_with_note._kc_noted = True
+            trainer_cls.training_step = training_step_with_note
+            trainer_cls._inner_training_loop = inner_loop_with_note
+    except Exception:  # noqa: BLE001 - only a report
+        pass

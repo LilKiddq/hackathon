@@ -62,7 +62,8 @@ class RMSNorm(torch.autograd.Function):
         block = triton.next_power_of_2(cols)
         # training: the backward pass gets x in fp16 (half the bytes to keep or offload; the
         # gradient moves by ~1e-3 relative, an approximation the task's tolerances allow)
-        half = x2.dtype == torch.float32 and torch.is_grad_enabled() and x.requires_grad
+        # (grad mode is off inside Function.forward: needs_input_grad says whether x needs one)
+        half = x2.dtype == torch.float32 and ctx.needs_input_grad[0]
         saved = torch.empty((rows, cols), device=x.device, dtype=torch.float16) if half else x2
         rms_norm_fwd_kernel[(rows,)](x2, weight, y, rstd, saved, x2.stride(0), cols, eps,
                                      SAVE_HALF=half, BLOCK=block,
