@@ -9,7 +9,7 @@
   **1,522×**; 14 345 → 735 MiB, **19,517×**; eval loss −0,017 %; ALL CHECKS PASSED; 57 passed
 - Kaggle, публичный ноутбук финального прогона: https://www.kaggle.com/code/narimanbolatuly/notebook0627412735
 - Demo video, до 3 минут: TBD.
-- Presentation: TBD; скелет docs/PRESENTATION_OUTLINE.md.
+- Presentation: [docs/presentation.pdf](docs/presentation.pdf) (10 слайдов; текст для озвучки — в заметках к слайдам)
 
 ## Team (до 4 человек)
 
