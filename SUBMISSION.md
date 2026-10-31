@@ -15,10 +15,10 @@
 
 | Имя | Роль | GitHub | Kaggle | Контакт капитана |
 |---|---|---|---|---|
-| Nariman Bolatuly | Капитан проекта | [bayesdz](https://github.com/bayesdz) | [narimanbolatuly](https://www.kaggle.com/narimanbolatuly) | — |
+| Nariman Bolatuly | Капитан проекта | [bayesdz](https://github.com/bayesdz) | [narimanbolatuly](https://www.kaggle.com/narimanbolatuly) | Telegram @bratiko1, 11townhall321@gmail.com |
 | Aidarov Bakhytzhan | Участник | [LilKiddq](https://github.com/LilKiddq) | [exagee](https://www.kaggle.com/exagee) | — |
-| Abu Sabytbek | Участник | [strogenyakuzo-blip](https://github.com/strogenyakuzo-blip) | — | — |
-| Madiyar Bakhtiyar | Участник | [Mad1yarBakhtiyar](https://github.com/Mad1yarBakhtiyar) | [madiyarbakhtiyar](https://www.kaggle.com/madiyarbakhtiyar) | — |
+| Abu Sabytbek | Участник | [strogenyakuzo-blip](https://github.com/strogenyakuzo-blip) | [bloovw](https://www.kaggle.com/bloovw) | — |
+| Madiyar Bakhtiyar | Участник; капитан при регистрации на edu.astanahub.com | [Mad1yarBakhtiyar](https://github.com/Mad1yarBakhtiyar) | [madiyarbakhtiyar](https://www.kaggle.com/madiyarbakhtiyar) | — |
 
 Все прогоны на Kaggle выполнялись с аккаунта narimanbolatuly.
 
