@@ -22,7 +22,6 @@ TIMEOUT_S = 120  # the warm-up takes ~10 s; past this the kernels just compile o
 
 def _compile_all():
     from .add_rmsnorm import AddRMSNorm
-    from .nf4 import dequantize_nf4
     from .rmsnorm import rms_norm
     from .rope import RoPE
     from .swiglu import swiglu
@@ -65,13 +64,8 @@ def _compile_all():
     target[::2] = -100
     fused_int8_head_ce(head_in, q8, s8, target, (target != -100).sum().float())[0].backward()
 
-    state2 = types.SimpleNamespace(code=torch.linspace(-1, 1, 256, device=device),
-                                   absmax=torch.ones(1, device=device), blocksize=256)
-    state = types.SimpleNamespace(shape=(32, 64), blocksize=64, state2=state2,
-                                  absmax=torch.zeros(32, device=device, dtype=torch.uint8),
-                                  offset=torch.zeros((), device=device))
-    dequantize_nf4(torch.zeros(1024, device=device, dtype=torch.uint8), state)
-
+    # (nf4_dequant_kernel, one weight per launch, is only the fallback: training dequantizes each
+    # layer in one launch, below; compiling it here would only take CPU from the model loading)
     from .nf4 import UnitMeta, dequantize_unit  # a whole layer in one launch (wstream.py)
 
     def fake_state(rows):
