@@ -2,7 +2,8 @@
 
 ## Links
 
-- Repository: https://github.com/LilKiddq/hackathon
+- Repository: https://github.com/BAITC-Hacks/hack-0e0f2cfa-kuchbrtna (репозиторий команды от организаторов;
+  публичное зеркало с теми же коммитами, которое клонирует Kaggle-ноутбук: https://github.com/LilKiddq/hackathon)
 - Final commit: TBD (измеренный код решения — v34, коммит 6b32d62; финальный коммит добавляет только документацию)
 - Kaggle, сохранённый запуск: https://www.kaggle.com/code/bloovw/notebookca2/output
 - Ссылка на конкретную версию с scriptVersionId: TBD. Публичность нового ноутбука ещё подтвердить.

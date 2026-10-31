@@ -7,7 +7,8 @@
 ## 1. Задача
 
 **Soup Kernel Challenge, Decentrathon 6.0.** Дедлайн: **31 октября 2026, 23:59 по Астане (18:59 UTC).**
-Команда Kuchbrtna, репозиторий `https://github.com/LilKiddq/hackathon` (создан платформой).
+Команда Kuchbrtna, репозиторий `https://github.com/BAITC-Hacks/hack-0e0f2cfa-kuchbrtna` (создан организаторами);
+публичное зеркало с теми же коммитами — `https://github.com/LilKiddq/hackathon` (его клонирует Kaggle-ноутбук).
 
 Нужно ускорить и/или облегчить по памяти фиксированный запуск `soup train` (soup-cli 0.77.0) на Kaggle T4
 своими Triton-кернелами, подключаемыми через `solution.apply()`. Задача (`task/task.yaml`, менять нельзя):
