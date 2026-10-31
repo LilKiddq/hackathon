@@ -31,7 +31,8 @@ from .swiglu import BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 
 MAX_IN_FLIGHT_BYTES = 128 << 20  # transfers the CPU lets run ahead before it waits for the oldest
 SAVED_MIN_BYTES = 256 << 10  # smaller saved tensors stay on the GPU (not worth a transfer)
-SAVED_PER_HIDDEN = 24  # arena estimate: bytes per token and hidden unit a layer saves
+SAVED_PER_HIDDEN = 16  # arena estimate: bytes per token and hidden unit a layer saves
+# (measured ~12.5: norms 2 x 2, LoRA inputs 2 x 2, masks 2 x 1, attention q + grouped k/v ~2.7)
 ALIGN = 512
 
 
@@ -271,6 +272,8 @@ class Offloader:
     # saved_tensors_hooks for everything else a decoder layer keeps for its backward pass
 
     def pack(self, tensor):
+        if not self.armed or tensor.numel() * tensor.element_size() < SAVED_MIN_BYTES:
+            return tensor  # most saved tensors (small ones): nothing else to look at
         seen = self.seen.get(id(tensor))
         if seen is not None and seen[0]() is tensor:  # the same tensor saved again
             if seen[1].entry.group == self.layer:
@@ -319,8 +322,8 @@ OFFLOADER = Offloader()
 
 def arena_bytes(config, max_tokens):
     """Host memory for one step, for max_tokens tokens: gate and up (fp16) of every layer, and
-    an estimate of what else a layer saves (two fp32 norm inputs, fp16 LoRA inputs, q/k/v and
-    the attention output, dropout masks: about 22 x hidden bytes per token)."""
+    an estimate of what else a layer saves (fp16 norm inputs, fp16 LoRA inputs and their dropout
+    masks, q and the grouped k/v: about 12.5 x hidden bytes per token, 16 with headroom)."""
     layers = getattr(config, "num_hidden_layers", 0)
     inter = getattr(config, "intermediate_size", 0)
     hidden = getattr(config, "hidden_size", 0) or 0
