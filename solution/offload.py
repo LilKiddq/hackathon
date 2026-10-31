@@ -87,8 +87,11 @@ class Offloader:
     def reserve(self, nbytes):
         """Pinned host memory for one step."""
         if self.arena is None or self.arena.numel() < nbytes:
+            from .diagtime import mark  # DIAG
+            mark(f"pin begin {nbytes >> 20} MiB")
             self.arena = None
             self.arena = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+            mark("pin end")
 
     def reserve_in_background(self, nbytes):
         """Pin the host memory in the background (pinning a few GB takes seconds)."""
@@ -100,11 +103,8 @@ class Offloader:
             atexit.register(self._reserving.join, 120)
 
     def _reserve_quietly(self, nbytes):
-        from .diagtime import mark  # DIAG
         try:
-            mark(f"pin begin {nbytes >> 20} MiB")
             self.reserve(nbytes)
-            mark("pin end")
         except Exception:  # noqa: BLE001 - without the arena the step reserves it, or keeps all on GPU
             self.arena = None
 
