@@ -5,9 +5,8 @@ projections: two [tokens, 8960] fp16 tensors per layer, ~1 MB per token over 28 
 half of the activation memory at the peak. SwiGLU's backward needs both.
 
 Here, right after SwiGLU's forward, they are copied to pinned host memory on a second CUDA
-stream while the GPU goes on with the next layers. The GPU tensors are released as soon as
-the copy is issued: `record_stream` keeps the caching allocator from reusing their memory until
-the copy stream has read them, so neither the CPU nor the GPU ever waits for a transfer. In the backward pass each
+stream while the GPU goes on with the next layers, and the GPU copies are released once the
+transfer is done (at most MAX_IN_FLIGHT_BYTES wait for their transfer). In the backward pass each
 layer's pair is copied back while the layer after it is still in its backward pass, so the
 transfer again overlaps compute.
 
@@ -30,6 +29,7 @@ import triton
 
 from .swiglu import BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 
+MAX_IN_FLIGHT_BYTES = 256 << 20  # transfers the CPU lets run ahead before it waits for the oldest
 SAVED_MIN_BYTES = 256 << 10  # smaller saved tensors stay on the GPU (not worth a transfer)
 SAVED_PER_HIDDEN = 24  # arena estimate: bytes per token and hidden unit a layer saves
 ALIGN = 512
@@ -68,6 +68,8 @@ class Offloader:
         self.cursor = 0
         self.entries = []  # this step's entries, in forward order
         self.groups = {}  # group (decoder layer, or entry index outside layers) -> its entries
+        self.in_flight = []  # entries whose GPU tensors are kept until their transfer is done
+        self.in_flight_bytes = 0
         self.armed = False
         self.layer = None  # the decoder layer whose forward is running (layer_offload)
         self.seen = {}  # this step's packed tensors, so a tensor saved twice is copied once
@@ -111,8 +113,8 @@ class Offloader:
         if self.stream is not None:
             self.stream.synchronize()
         self.peak_cursor = max(self.peak_cursor, self.cursor)
-        self.entries, self.groups, self.cursor = [], {}, 0
-        self.layer, self.seen = None, {}
+        self.entries, self.groups, self.in_flight, self.cursor = [], {}, [], 0
+        self.in_flight_bytes, self.layer, self.seen = 0, None, {}
         self.pending, self.pending_entry = [], None
         if nbytes:
             self._reserve_quietly(nbytes)  # if pinning fails, the step runs without offloading
@@ -165,11 +167,9 @@ class Offloader:
             entry.copied = torch.cuda.Event()
             entry.copied.record(self.stream)
         entry.host = tuple(views)
-        # the GPU tensors are dropped now: record_stream keeps the allocator from reusing their
-        # memory until the copy stream has read them, so neither the CPU nor the GPU waits here
-        for t in tensors:
-            t.record_stream(self.stream)
-        entry.gpu = None
+        self.in_flight.append(entry)
+        self.in_flight_bytes += entry.nbytes
+        self._retire()
 
     def save(self, *tensors):
         """Start copying dense GPU tensors to the arena; returns their entry for `load`."""
@@ -188,9 +188,31 @@ class Offloader:
             entry.remaining = len(entry.gpu)
             self._start_copy(entry)
 
+    def _retire(self):
+        """Drop the GPU tensors whose transfer is done. The caching allocator reuses their memory
+        in the compute stream's order, which is safe once the copy stream has read them."""
+        waiting = []
+        for entry in self.in_flight:
+            if entry.copied.query():
+                entry.gpu = None
+                self.in_flight_bytes -= entry.nbytes
+            else:
+                waiting.append(entry)
+        while waiting and self.in_flight_bytes > MAX_IN_FLIGHT_BYTES:
+            entry = waiting.pop(0)
+            entry.copied.synchronize()
+            entry.gpu = None
+            self.in_flight_bytes -= entry.nbytes
+        self.in_flight = waiting
+
     def release_all(self):
-        """Before the head: the last layer's saved tensors start their copy (flush)."""
+        """Wait for the transfers still in flight and drop their GPU tensors. Called before the
+        head, whose logits chunk would otherwise sit next to the last layers' tensors."""
         self.flush()
+        for entry in self.in_flight:
+            entry.copied.synchronize()
+            entry.gpu = None
+        self.in_flight, self.in_flight_bytes = [], 0
 
     def _fetch_group(self, group):
         for entry in self.groups.get(group, ()):
