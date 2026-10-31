@@ -27,6 +27,7 @@ from .fused_ce import IGNORE_INDEX, NEG
 TILE_V = 8192  # vocabulary rows per tile: 8192 x 1536 fp16 = 25 MB, logits n x 8192
 BLOCK_V = 2048
 BLOCK_H = 2048
+SLICE = 8192  # rows quantized at a time: 8192 x 1536 fp32 = 50 MB
 
 
 @triton.jit
@@ -104,15 +105,19 @@ def head_grad_kernel(logits_ptr, stride, target_ptr, lse_ptr, coef_ptr, tile_sta
 
 
 def quantize_rows(weight):
-    """int8 rows with one fp32 absmax scale each (round to nearest)."""
-    w = weight.float()
-    scale = w.abs().amax(dim=1).clamp(min=1e-12) / 127.0
+    """int8 rows with one fp32 absmax scale each (round to nearest). In slices of SLICE rows, so
+    no full-size fp32 copy of the weight ever exists (that would be the run's memory peak)."""
+    rows = weight.shape[0]
     q = torch.empty(weight.shape, dtype=torch.int8, device=weight.device)
-    for start in range(0, weight.shape[0], 16384):  # in slices: no full fp32 copy at once
-        stop = start + 16384
-        q[start:stop] = torch.round(weight[start:stop].float() / scale[start:stop, None]) \
-            .clamp_(-127, 127).to(torch.int8)
-    return q, scale.contiguous()
+    scale = torch.empty(rows, dtype=torch.float32, device=weight.device)
+    for start in range(0, rows, SLICE):
+        part = weight[start:start + SLICE].float()
+        part_scale = part.abs().amax(dim=1).clamp_(min=1e-12).div_(127.0)
+        scale[start:start + SLICE] = part_scale
+        q[start:start + SLICE] = part.div_(part_scale[:, None]).round_().clamp_(-127, 127) \
+            .to(torch.int8)
+        del part
+    return q, scale
 
 
 def dequant_rows(q, scale, out=None):

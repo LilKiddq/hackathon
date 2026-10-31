@@ -20,7 +20,7 @@ import torch
 from torch.nn import functional
 
 from . import offload, warmup
-from .wstream import STREAMER
+from .wstream import STREAMER, trainable_to_gpu, weights_to_host_while_loading
 from .fused_ce import IGNORE_INDEX, fused_lm_head_ce
 from .head8 import Int8Embedding, dequant_rows, fused_int8_head_ce, quantize_rows
 
@@ -341,9 +341,12 @@ def patch_soup_setup():
             patch_kbit_preparation()  # peft is imported here anyway, right before it is used
         except Exception:  # noqa: BLE001 - without it the upcast happens and is undone below
             pass
-        result = original(self, *args, **kwargs)
+        with weights_to_host_while_loading() as hosted:
+            result = original(self, *args, **kwargs)
         model = getattr(self, "model", None)
         if isinstance(model, torch.nn.Module):
+            if hosted and _causal_lm(model) is not None:
+                trainable_to_gpu(model)
             _fp16_tied_embedding(model)
             _int8_tied_embedding(model)
         return result

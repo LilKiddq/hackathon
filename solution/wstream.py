@@ -10,6 +10,8 @@ transfer overlaps compute and only a window of ~AHEAD weights sits on the GPU at
 The dequantization reads exactly the same bytes, so the numbers do not change.
 """
 
+import contextlib
+
 import torch
 
 AHEAD = 8  # projections fetched ahead of the one in use (~one decoder layer, ~25 MB)
@@ -39,12 +41,14 @@ class WeightStreamer:
                 weight = getattr(module, "weight", None)
                 state = getattr(weight, "quant_state", None)
                 if (type(module).__name__ != "Linear4bit" or weight is None or state is None
-                        or not weight.is_cuda or weight.dtype != torch.uint8
-                        or not supported(state)):
+                        or weight.dtype != torch.uint8 or not supported(state)
+                        or not (weight.is_cuda or weight.is_pinned())):
                     continue
-                host = torch.empty(weight.shape, dtype=weight.dtype, pin_memory=True)
-                host.copy_(weight.data)
-                weight.data = host
+                if weight.is_cuda:
+                    host = torch.empty(weight.shape, dtype=weight.dtype, pin_memory=True)
+                    host.copy_(weight.data)
+                    weight.data = host
+                host = weight.data  # already on the host when loading put it there
                 self.index[host.data_ptr()] = len(self.host)
                 self.host.append(host)
         if self.host:
@@ -94,3 +98,43 @@ class WeightStreamer:
 
 
 STREAMER = WeightStreamer()
+
+
+@contextlib.contextmanager
+def weights_to_host_while_loading():
+    """While Soup loads the model: each 4-bit weight goes to pinned host memory as soon as
+    bitsandbytes has quantized it on the GPU, so the packed weights never all sit on the GPU
+    together (that, next to the embedding, was the run's memory peak during setup)."""
+    try:
+        import bitsandbytes
+        cls = bitsandbytes.nn.Params4bit
+        original = cls._quantize
+    except Exception:  # noqa: BLE001 - another bitsandbytes: weights move at the first step
+        yield []
+        return
+    hosted = []
+
+    def _quantize(self, device):
+        result = original(self, device)
+        data = result.data
+        if data.is_cuda and data.dtype == torch.uint8:
+            host = torch.empty(data.shape, dtype=data.dtype, pin_memory=True)
+            host.copy_(data)
+            result.data = host
+            hosted.append(host.data_ptr())
+        return result
+
+    cls._quantize = _quantize
+    try:
+        yield hosted
+    finally:
+        cls._quantize = original
+
+
+def trainable_to_gpu(model):
+    """peft puts each LoRA adapter on its base layer's device; with the base weight on the host
+    that is the CPU, so the (small) trainable parameters are moved back to the GPU."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    for param in model.parameters():
+        if param.requires_grad and not param.is_cuda:
+            param.data = param.data.to(device)
