@@ -57,9 +57,23 @@ def _row_attention(module, hidden_states, position_embeddings, index, seq, rows)
 
     n = hidden_states.shape[1]
     shape = (1, n, -1, module.head_dim)
-    query = module.q_proj(hidden_states).view(shape).transpose(1, 2)
-    key = module.k_proj(hidden_states).view(shape).transpose(1, 2)
-    value = module.v_proj(hidden_states).view(shape).transpose(1, 2)
+    parts = _projection_parts(module, hidden_states)
+    if parts is not None:  # q/k/v as one autograd node, LoRA added as peft adds it
+        bases, wrappers = parts
+        query, key, value = FusedQKV.apply(hidden_states, *bases)
+        query = query.float().add_(_lora_delta(wrappers[0], hidden_states)) \
+            if wrappers[0] is not None else query
+        if wrappers[2] is not None:
+            value = value + _lora_delta(wrappers[2], hidden_states)
+        if wrappers[1] is not None:
+            key = key + _lora_delta(wrappers[1], hidden_states)
+        query = query.view(shape).transpose(1, 2)
+        key = key.view(shape).transpose(1, 2)
+        value = value.view(shape).transpose(1, 2)
+    else:
+        query = module.q_proj(hidden_states).view(shape).transpose(1, 2)
+        key = module.k_proj(hidden_states).view(shape).transpose(1, 2)
+        value = module.v_proj(hidden_states).view(shape).transpose(1, 2)
 
     cos, sin = position_embeddings
     packed = _rope_cache.get(id(cos))
@@ -77,7 +91,107 @@ def _row_attention(module, hidden_states, position_embeddings, index, seq, rows)
         query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
     groups = getattr(module, "num_key_value_groups", 1)
     attn_output = RowsAttention.apply(query, key, value, tuple(rows), groups, module.scaling)
-    return module.o_proj(attn_output), None
+    o_proj = module.o_proj
+    if parts is not None and _plain_4bit(o_proj) and o_proj.bias is None \
+            and attn_output.dtype == torch.float16:
+        from .nf4 import NF4Linear  # bitsandbytes' wrapper and our matmul_4bit patch skipped
+
+        return NF4Linear.apply(attn_output, o_proj.weight, o_proj.weight.quant_state, None), None
+    return o_proj(attn_output), None
+
+
+def _plain_4bit(module):
+    from .nf4 import supported
+
+    weight = getattr(module, "weight", None)
+    state = getattr(weight, "quant_state", None)
+    return (type(module).__name__ == "Linear4bit" and not hasattr(module, "base_layer")
+            and getattr(module, "compute_dtype", None) == torch.float16
+            and state is not None and weight.dtype == torch.uint8 and supported(state))
+
+
+def _lora_wrapper(module):
+    """peft's LoRA layer around a 4-bit projection, in the plain case (vanilla LoRA, not merged,
+    adapters on): the one this training uses. None for anything else."""
+    if not hasattr(module, "base_layer"):
+        return None
+    if (getattr(module, "disable_adapters", True) or getattr(module, "merged", True)
+            or getattr(module, "lora_variant", None)):
+        return None
+    active = [name for name in module.active_adapters if name in module.lora_A.keys()]
+    return module if active else None
+
+
+def _projection_parts(module, hidden_states):
+    """The 4-bit base layers of q/k/v (and their LoRA wrappers) when the fused path applies:
+    training under fp16 autocast, frozen 4-bit bases, LoRA as plain peft LoRA. Else None."""
+    if not (torch.is_grad_enabled() and hidden_states.requires_grad and hidden_states.is_cuda
+            and torch.is_autocast_enabled("cuda")
+            and torch.get_autocast_dtype("cuda") == torch.float16):
+        return None
+    bases, wrappers = [], []
+    for proj in (module.q_proj, module.k_proj, module.v_proj):
+        wrapper = _lora_wrapper(proj)
+        if wrapper is None and hasattr(proj, "base_layer"):
+            return None  # some other adapter type: the module path
+        base = proj.base_layer if wrapper is not None else proj
+        if not _plain_4bit(base) or (base.bias is not None and base.bias.requires_grad):
+            return None
+        bases.append(base)
+        wrappers.append(wrapper)
+    return bases, wrappers
+
+
+def _lora_delta(wrapper, x):
+    """peft's LoRA term for the active adapters, as peft computes it under autocast:
+    lora_B(lora_A(dropout(x))) * scaling (the same modules, the same random draws)."""
+    total = None
+    for name in wrapper.active_adapters:
+        if name not in wrapper.lora_A.keys():
+            continue
+        out = wrapper.lora_B[name](wrapper.lora_A[name](wrapper.lora_dropout[name](x))) \
+            * wrapper.scaling[name]
+        total = out if total is None else total + out
+    return total
+
+
+def _fp16_bias(layer):
+    bias = layer.bias
+    if bias is not None and bias.dtype != torch.float16:
+        bias.data = bias.data.to(torch.float16)  # what bitsandbytes' Linear4bit.forward does
+    return bias
+
+
+class FusedQKV(torch.autograd.Function):
+    """The 4-bit q/k/v base projections as one autograd node (fp16 outputs, frozen fp16 biases):
+    x cast to fp16 once, each weight dequantized (streamed, wstream.py) and multiplied as
+    before. The backward pass returns x's gradient as the sum of the three input gradients in
+    x's dtype, as autograd summed them before."""
+
+    @staticmethod
+    def forward(ctx, x, q_layer, k_layer, v_layer):
+        from .mlp import _weight
+
+        flat = x.reshape(-1, x.shape[-1]).to(torch.float16)
+        outs = tuple(torch.nn.functional.linear(flat, _weight(layer), _fp16_bias(layer))
+                     for layer in (q_layer, k_layer, v_layer))
+        ctx.layers, ctx.x_dtype, ctx.x_shape = (q_layer, k_layer, v_layer), x.dtype, x.shape
+        return tuple(out.view(*x.shape[:-1], out.shape[-1]) for out in outs)
+
+    @staticmethod
+    def backward(ctx, grad_q, grad_k, grad_v):
+        from .mlp import _weight
+
+        dx = None
+        # backward order of the streamed weights: v, k, q
+        for grad, layer in ((grad_v, ctx.layers[2]), (grad_k, ctx.layers[1]),
+                            (grad_q, ctx.layers[0])):
+            if grad is None:
+                continue
+            part = (grad.reshape(-1, grad.shape[-1]).to(torch.float16) @ _weight(layer)) \
+                .to(ctx.x_dtype)
+            dx = part if dx is None else dx.add_(part)
+        return (dx.view(ctx.x_shape) if dx is not None else None), None, None, None
 
 
 def _attend(query, key, value, rows, groups, scale):

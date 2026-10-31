@@ -614,6 +614,42 @@ def test_layer_batched_weight_streaming_gives_the_same_results():
         ws.HOST_BLOCK = saved_block
 
 
+def test_fused_qkv_matches_the_module_path():
+    """unpad.FusedQKV (q/k/v 4-bit base projections as one node) against the same math op by op:
+    the same outputs (fp16, with the frozen biases) and x's gradient summed in fp32."""
+    import bitsandbytes as bnb
+    from solution.nf4 import dequantize_nf4
+    from solution.unpad import FusedQKV, _plain_4bit
+
+    torch.manual_seed(9)
+    hidden, kv, tokens = 256, 64, 200
+
+    def layer(n_in, n_out):
+        module = bnb.nn.Linear4bit(n_in, n_out, bias=True, compute_dtype=torch.float16,
+                                   quant_type="nf4", compress_statistics=True)
+        module.weight = bnb.nn.Params4bit((torch.randn(n_out, n_in) * 0.05).half(),
+                                          requires_grad=False, quant_type="nf4",
+                                          compress_statistics=True)
+        module.bias = torch.nn.Parameter(torch.randn(n_out) * 0.1, requires_grad=False)
+        return module.cuda()
+
+    q, k, v = layer(hidden, hidden), layer(hidden, kv), layer(hidden, kv)
+    assert all(_plain_4bit(m) for m in (q, k, v))
+    x = torch.randn(1, tokens, hidden, device="cuda", requires_grad=True)
+    grads = [torch.randn(1, tokens, n, device="cuda", dtype=torch.float16) for n in (hidden, kv, kv)]
+    x16 = x.to(torch.float16)
+    refs = [torch.nn.functional.linear(x16, dequantize_nf4(m.weight, m.weight.quant_state),
+                                       m.bias.to(torch.float16)) for m in (q, k, v)]
+    torch.autograd.backward(refs, grads)
+    ref_grad, x.grad = x.grad, None
+    outs = FusedQKV.apply(x, q, k, v)
+    torch.autograd.backward(outs, grads)
+    for out, ref in zip(outs, refs):
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    assert x.grad.dtype == torch.float32
+    torch.testing.assert_close(x.grad, ref_grad, rtol=1e-3, atol=1e-3)
+
+
 def test_warmup_leaves_the_global_rng_alone():
     from solution import warmup
 
