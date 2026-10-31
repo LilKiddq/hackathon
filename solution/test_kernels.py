@@ -264,7 +264,7 @@ def test_offloaded_swiglu_matches_and_frees_gpu_memory():
     del x
 
     config = type("Config", (), {"num_hidden_layers": layers, "intermediate_size": inter})()
-    OFFLOADER.new_step(arena_bytes(config, tokens))
+    OFFLOADER.new_step(arena_bytes(config, tokens, mlp_pairs=True))
     try:
         before = torch.cuda.memory_allocated()
         x, out = run(OffloadedSwiGLU.apply)
@@ -308,11 +308,11 @@ def test_offloaded_swiglu_without_synchronization():
     config = type("Config", (), {"num_hidden_layers": layers, "intermediate_size": inter})()
     try:
         for _ in range(3):  # several steps reuse the same host arena
-            OFFLOADER.new_step(arena_bytes(config, tokens))
+            OFFLOADER.new_step(arena_bytes(config, tokens, mlp_pairs=True))
             out, grad = run(OffloadedSwiGLU.apply)
             torch.testing.assert_close(out, ref, rtol=0, atol=0)
             torch.testing.assert_close(grad, ref_grad, rtol=0, atol=0)
-            OFFLOADER.new_step(arena_bytes(config, tokens))
+            OFFLOADER.new_step(arena_bytes(config, tokens, mlp_pairs=True))
             x = x0.clone().requires_grad_()
             h = x
             for wg, wu, wd in weights:

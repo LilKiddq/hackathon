@@ -320,16 +320,18 @@ class Offloader:
 OFFLOADER = Offloader()
 
 
-def arena_bytes(config, max_tokens):
-    """Host memory for one step, for max_tokens tokens: gate and up (fp16) of every layer, and
-    an estimate of what else a layer saves (fp16 norm inputs, fp16 LoRA inputs and their dropout
-    masks, q and the grouped k/v: about 12.5 x hidden bytes per token, 16 with headroom)."""
+def arena_bytes(config, max_tokens, mlp_pairs=False):
+    """Host memory for one step, for max_tokens tokens: what a decoder layer saves for its
+    backward pass (fp16 norm inputs, fp16 LoRA inputs and their dropout masks, q and the grouped
+    k/v, the MLP's fp16 input: about 14.5 x hidden bytes per token, 18 with headroom), plus gate
+    and up (fp16) of every layer when the MLP keeps them (mlp_pairs: the module path)."""
     layers = getattr(config, "num_hidden_layers", 0)
     inter = getattr(config, "intermediate_size", 0)
     hidden = getattr(config, "hidden_size", 0) or 0
     if not layers or not inter or not max_tokens:
         return 0
-    return layers * (max_tokens * (2 * inter * 2 + SAVED_PER_HIDDEN * hidden) + 32 * ALIGN)
+    per_token = (SAVED_PER_HIDDEN + 2) * hidden + (2 * inter * 2 if mlp_pairs else 0)
+    return layers * (max_tokens * per_token + 32 * ALIGN)
 
 
 def _report():
