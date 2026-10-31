@@ -28,16 +28,17 @@ from .head8 import Int8Embedding, dequant_rows, fused_int8_head_ce, quantize_row
 STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR, read by rewind
 
 
-_PEAKS = []  # (where, MiB): each point where the allocator's peak had grown since the last one
+_PEAKS = []  # (where, MiB allocated, MiB reserved): each point where a peak had grown
 _STEP = [0]
 
 
 def _note_peak(where):
-    """Reads the allocator's peak (a host-side counter: no sync, nothing reset)."""
+    """Reads the allocator's peaks (host-side counters: no sync, nothing reset)."""
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         peak = torch.cuda.max_memory_allocated() >> 20
-        if not _PEAKS or peak > _PEAKS[-1][1]:
-            _PEAKS.append((where, peak))
+        reserved = torch.cuda.max_memory_reserved() >> 20
+        if not _PEAKS or peak > _PEAKS[-1][1] or reserved > _PEAKS[-1][2]:
+            _PEAKS.append((where, peak, reserved))
 
 
 def _report_peaks():
@@ -47,7 +48,7 @@ def _report_peaks():
         from .wstream import EMBEDDING_ON_HOST, LOADED_TO_HOST
 
         print("[solution] allocator peak grew at: "
-              + " | ".join(f"{where} {mib} MiB" for where, mib in _PEAKS[-12:])
+              + " | ".join(f"{where} {mib} MiB (reserved {res})" for where, mib, res in _PEAKS[-14:])
               + f" | loading: {LOADED_TO_HOST[0]} 4-bit weights and "
               + ("the" if EMBEDDING_ON_HOST[0] else "not the") + " embedding to host",
               file=sys.stderr)
@@ -189,6 +190,13 @@ def patch_sft_trainer():
             (getattr(self.args, "max_length", 0) or 0) or inputs["input_ids"].numel()
         offload.OFFLOADER.new_step(offload.arena_bytes(lm.config, max_tokens))
         STREAMER.install(lm)  # once: the 4-bit weights move to host memory (wstream.py)
+        # The previous step's blocks are free now but stay cached, sized for that step's token
+        # count; the next steps' blocks, sized differently, leave holes between them, and the
+        # memory the allocator holds grew ~110-130 MiB above what was ever allocated (560 vs 433
+        # MiB at the peak). Releasing them here, between steps, lets each step map only what it
+        # uses; little is queued on the GPU at this point, so the wait inside empty_cache (it
+        # unmaps memory only after the stream is done with it) is short. Numbers are unaffected.
+        torch.cuda.empty_cache()
         STREAMER.new_step()
         mode = "train"
         inputs.pop("_prediction_loss_only", None)  # as TRL does before it delegates
