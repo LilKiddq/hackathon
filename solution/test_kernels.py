@@ -264,7 +264,7 @@ def test_offloaded_swiglu_matches_and_frees_gpu_memory():
     del x
 
     config = type("Config", (), {"num_hidden_layers": layers, "intermediate_size": inter})()
-    OFFLOADER.new_step(arena_bytes(config, tokens))
+    OFFLOADER.new_step(arena_bytes(config, tokens, mlp_pairs=True))
     try:
         before = torch.cuda.memory_allocated()
         x, out = run(OffloadedSwiGLU.apply)
@@ -308,11 +308,11 @@ def test_offloaded_swiglu_without_synchronization():
     config = type("Config", (), {"num_hidden_layers": layers, "intermediate_size": inter})()
     try:
         for _ in range(3):  # several steps reuse the same host arena
-            OFFLOADER.new_step(arena_bytes(config, tokens))
+            OFFLOADER.new_step(arena_bytes(config, tokens, mlp_pairs=True))
             out, grad = run(OffloadedSwiGLU.apply)
             torch.testing.assert_close(out, ref, rtol=0, atol=0)
             torch.testing.assert_close(grad, ref_grad, rtol=0, atol=0)
-            OFFLOADER.new_step(arena_bytes(config, tokens))
+            OFFLOADER.new_step(arena_bytes(config, tokens, mlp_pairs=True))
             x = x0.clone().requires_grad_()
             h = x
             for wg, wu, wd in weights:
@@ -373,7 +373,8 @@ def test_saved_tensor_offload_matches_and_frees_gpu_memory():
             x, out = run(True)
             OFFLOADER.release_all()
             torch.cuda.synchronize()
-            torch.empty(1, device="cuda")  # the allocator frees the copied tensors on its next call
+            OFFLOADER._retire_all_done()  # as at the start of the backward pass (prefetch_last)
+            torch.empty(1, device="cuda")
             assert OFFLOADER.entries and all(e.host is not None for e in OFFLOADER.entries)
             assert torch.cuda.memory_allocated() - before < kept_plain * 0.75
             OFFLOADER.prefetch_last()
@@ -612,6 +613,30 @@ def test_layer_batched_weight_streaming_gives_the_same_results():
             nf4.STREAMER = saved
     finally:
         ws.HOST_BLOCK = saved_block
+
+
+def test_layer_dequantized_in_one_launch_matches_bitsandbytes():
+    """nf4.dequantize_unit: several NF4 weights packed back to back, dequantized in one launch,
+    bit for bit what bitsandbytes (and our per-weight kernel) give for each."""
+    import bitsandbytes.functional as F
+    from solution.nf4 import UnitMeta, dequantize_nf4, dequantize_unit
+
+    torch.manual_seed(10)
+    shapes = [(256, 256), (64, 256), (512, 256), (64, 256)]
+    quantized = [F.quantize_4bit((torch.randn(shape, device="cuda") * 0.05).half(), blocksize=64,
+                                 quant_type="nf4", compress_statistics=True) for shape in shapes]
+    sizes = [packed.numel() for packed, _ in quantized]
+    starts = [sum(sizes[:i]) for i in range(len(sizes))]
+    region = torch.cat([packed.reshape(-1) for packed, _ in quantized])
+    states = [state for _, state in quantized]
+    refs = [F.dequantize_4bit(packed, state).half() for packed, state in quantized]
+    assert UnitMeta.fits(states, starts, sizes)
+    meta = UnitMeta(states, starts, region.device)
+    out = dequantize_unit(region, meta)
+    for (rows, cols), start, ref, (packed, state) in zip(shapes, starts, refs, quantized):
+        got = out[2 * start:2 * start + rows * cols].view(rows, cols)
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+        torch.testing.assert_close(dequantize_nf4(packed, state), ref, rtol=0, atol=0)
 
 
 def test_warmup_leaves_the_global_rng_alone():
