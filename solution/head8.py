@@ -8,14 +8,16 @@ logits by a few hundredths and the loss by far less than the task's tolerances (
 The embedding lookup dequantizes the looked-up rows; the head dequantizes the weight a vocabulary
 tile at a time, so no full fp16 copy ever exists.
 
-Head + loss in two passes over vocabulary tiles of TILE_V rows:
+Head + loss in one pass over vocabulary tiles of TILE_V rows:
 1. logits tile = x @ dequant(tile).T for every row (fp16, as under autocast); one Triton program
    per row reduces it to partial statistics: running max, sum of exp, sum of exp * logit, best
    value and its index, and the label's logit when it falls in the tile. The partials of all tiles
    are merged into log-sum-exp, entropy, argmax and the loss.
-2. for the labelled rows only: the logits tile is recomputed, turned in place into
-   coef * (softmax - onehot) in fp16 (as in fused_ce.py), and its product with the tile is added
-   to an fp32 gradient. The backward pass only rescales that gradient.
+   In the same pass, for the labelled rows, the tile is turned in place into exp(x - running max)
+   (fp16) and its product with the tile is added to an fp32 sum, rescaled whenever the row's
+   running max grows (the online softmax of FlashAttention, applied to the head's gradient). At
+   the end softmax @ W = sum / sum-of-exp, and the gradient is softmax @ W - W[target]: one pass,
+   one matmul per tile for the logits and one for the gradient. The backward pass only rescales.
 """
 
 import torch
@@ -43,8 +45,8 @@ def int8_rows_dequant_kernel(q_ptr, scale_ptr, out_ptr, H, BLOCK_H: tl.constexpr
 
 @triton.jit(do_not_specialize=["tile_start", "tile_index", "n_tiles", "TV"])
 def head_partial_kernel(logits_ptr, stride, target_ptr, part_ptr, best_idx_ptr, target_logit_ptr,
-                        tile_start, tile_index, n_tiles, TV, BLOCK_V: tl.constexpr,
-                        NEG: tl.constexpr):
+                        run_max_ptr, alpha_ptr, n_grad, tile_start, tile_index, n_tiles, TV,
+                        WITH_GRAD: tl.constexpr, BLOCK_V: tl.constexpr, NEG: tl.constexpr):
     """One program per row: this tile's max, sum exp(x - max), sum exp(x - max) * x, best value
     (index of its first occurrence), and the label's logit if the label is in this tile."""
     row = tl.program_id(0).to(tl.int64)
@@ -84,24 +86,19 @@ def head_partial_kernel(logits_ptr, stride, target_ptr, part_ptr, best_idx_ptr, 
     local = target - tile_start
     if (target != -100) & (local >= 0) & (local < TV):
         tl.store(target_logit_ptr + row, tl.load(row_ptr + local).to(tl.float32))
-
-
-@triton.jit(do_not_specialize=["tile_start", "TV"])
-def head_grad_kernel(logits_ptr, stride, target_ptr, lse_ptr, coef_ptr, tile_start, TV,
-                     BLOCK_V: tl.constexpr):
-    """In place, one program per labelled row: coef * (exp(x - lse) - onehot(target)), fp16."""
-    row = tl.program_id(0).to(tl.int64)
-    row_ptr = logits_ptr + row * stride
-    target = tl.load(target_ptr + row) - tile_start
-    lse = tl.load(lse_ptr + row)
-    coef = tl.load(coef_ptr)
-    lanes = tl.arange(0, BLOCK_V)
-    for start in range(0, TV, BLOCK_V):
-        cols = start + lanes
-        valid = cols < TV
-        x = tl.load(row_ptr + cols, mask=valid, other=0.0).to(tl.float32)
-        grad = tl.exp(x - lse) - tl.where(cols == target, 1.0, 0.0)
-        tl.store(row_ptr + cols, (grad * coef).to(tl.float16), mask=valid)
+    if WITH_GRAD:
+        if row < n_grad:
+            # online softmax for the gradient: the row's running max over the tiles so far; the
+            # tile becomes exp(x - max) in place, and the sum so far is rescaled by alpha
+            old_max = tl.load(run_max_ptr + row)
+            new_max = tl.maximum(old_max, row_max)
+            tl.store(run_max_ptr + row, new_max)
+            tl.store(alpha_ptr + row, tl.exp(old_max - new_max))
+            for start in range(0, TV, BLOCK_V):
+                cols = start + lanes
+                valid = cols < TV
+                x = tl.load(row_ptr + cols, mask=valid, other=NEG).to(tl.float32)
+                tl.store(row_ptr + cols, tl.exp(x - new_max).to(tl.float16), mask=valid)
 
 
 def quantize_rows(weight):
@@ -171,6 +168,11 @@ class FusedInt8HeadCE(torch.autograd.Function):
         part = torch.empty((n, n_tiles, 4), device=device, dtype=torch.float32)
         best_idx = torch.empty((n, n_tiles), device=device, dtype=torch.int32)
         target_logit = torch.zeros(n, device=device, dtype=torch.float32)
+        n_grad = n_labelled if with_grad else 0
+        # sum over tiles of exp(logits - running max) @ tile, for the labelled rows (fp32)
+        acc = torch.zeros((max(n_grad, 1), width), device=device, dtype=torch.float32)
+        run_max = torch.full((max(n_grad, 1),), NEG, device=device, dtype=torch.float32)
+        alpha = torch.empty_like(run_max)
         tile = torch.empty((min(TILE_V, vocab), width), device=device, dtype=torch.float16)
         logits_buf = torch.empty((n, min(TILE_V, vocab)), device=device, dtype=torch.float16) \
             if n else None
@@ -183,7 +185,12 @@ class FusedInt8HeadCE(torch.autograd.Function):
                 torch.matmul(x16, w.t(), out=logits)
                 head_partial_kernel[(n,)](
                     logits, logits.stride(0), ordered_target, part, best_idx, target_logit,
-                    start, index, n_tiles, stop - start, BLOCK_V=BLOCK_V, NEG=NEG, num_warps=8)
+                    run_max, alpha, n_grad, start, index, n_tiles, stop - start,
+                    WITH_GRAD=n_grad > 0, BLOCK_V=BLOCK_V, NEG=NEG, num_warps=8)
+                if n_grad:
+                    acc.mul_(alpha[:, None])
+                    acc += torch.matmul(logits[:n_grad], w).float()
+        del tile, logits_buf
 
         top_m = part[..., 0].amax(dim=1, keepdim=True)
         rescale = torch.exp(part[..., 0] - top_m)
@@ -198,20 +205,12 @@ class FusedInt8HeadCE(torch.autograd.Function):
         hit = (lab & (argmax == ordered_target)).to(torch.int32)
 
         grad = None
-        if with_grad and n_labelled:
-            grad = torch.zeros((n_labelled, width), device=device, dtype=torch.float32)
-            xl, tl_, lse_l = x16[:n_labelled], ordered_target[:n_labelled], lse[:n_labelled]
-            for index in range(n_tiles):
-                start = index * TILE_V
-                stop = min(vocab, start + TILE_V)
-                w = dequant_rows(q[start:stop], scale[start:stop], tile[: stop - start])
-                logits = logits_buf[:n_labelled, : stop - start]
-                torch.matmul(xl, w.t(), out=logits)
-                head_grad_kernel[(n_labelled,)](logits, logits.stride(0), tl_, lse_l, coef,
-                                                start, stop - start, BLOCK_V=BLOCK_V,
-                                                num_warps=8)
-                grad += torch.matmul(logits, w).float()
-        del tile, logits_buf
+        if n_grad:
+            # d loss_row / d x = softmax @ W - W[target]; the running max ends at the row's max,
+            # so acc / total is softmax @ W
+            labels = ordered_target[:n_grad]
+            target_rows = dequant_rows(q.index_select(0, labels), scale.index_select(0, labels))
+            grad = (acc / total[:n_grad, None] - target_rows.float()) * coef
 
         def unorder(values):
             return torch.empty_like(values).index_copy_(0, order, values)
