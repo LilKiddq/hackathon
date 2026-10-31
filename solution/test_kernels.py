@@ -559,6 +559,61 @@ def test_fused_mlp_matches_the_module_path():
     torch.testing.assert_close(x.grad, ref_grad, rtol=5e-3, atol=5e-3)
 
 
+def test_layer_batched_weight_streaming_gives_the_same_results():
+    """wstream with the packed weights of each 'layer' (here 4 weights) in one region of a pinned
+    block: one copy per layer, views per weight; the same results bit for bit, over steps."""
+    import types
+
+    import bitsandbytes.functional as F
+    import solution.nf4 as nf4
+    import solution.wstream as ws
+    from solution.nf4 import NF4Linear
+
+    torch.manual_seed(8)
+    layers = [F.quantize_4bit((torch.randn(256, 256, device="cuda") * 0.05).half(),
+                              blocksize=64, quant_type="nf4", compress_statistics=True)
+              for _ in range(12)]
+    x0 = torch.randn(64, 256, device="cuda", dtype=torch.float16)
+    grad = torch.randn(64, 256, device="cuda", dtype=torch.float16)
+
+    def run(weights):
+        x = x0.clone().requires_grad_()
+        h = x
+        for packed, (_, state) in zip(weights, layers):
+            h = torch.tanh(NF4Linear.apply(h, packed, state))
+        h.backward(grad)
+        return h.detach(), x.grad
+
+    ref = run([packed for packed, _ in layers])
+    block = types.SimpleNamespace(block=torch.empty(1 << 20, dtype=torch.uint8, pin_memory=True))
+    saved_block, ws.HOST_BLOCK = ws.HOST_BLOCK, block
+    streamer, hosts, cursor = ws.WeightStreamer(), [], 0
+    try:
+        for first in range(0, len(layers), 4):
+            for packed, _ in layers[first:first + 4]:
+                start = -(-cursor // 512) * 512
+                cursor = start + packed.numel()
+                host = block.block[start:cursor].view(packed.shape)
+                host.copy_(packed)
+                streamer.index[host.data_ptr()] = len(streamer.host)
+                streamer.host.append(host)
+                hosts.append(host)
+            streamer._add_units(range(first, len(streamer.host)))
+        assert len(streamer.units) == 3
+        streamer.stream = torch.cuda.Stream()
+        saved, nf4.STREAMER = nf4.STREAMER, streamer
+        try:
+            for _ in range(3):
+                streamer.new_step()
+                out = run(hosts)
+                torch.testing.assert_close(out[0], ref[0], rtol=0, atol=0)
+                torch.testing.assert_close(out[1], ref[1], rtol=0, atol=0)
+        finally:
+            nf4.STREAMER = saved
+    finally:
+        ws.HOST_BLOCK = saved_block
+
+
 def test_warmup_leaves_the_global_rng_alone():
     from solution import warmup
 

@@ -15,15 +15,28 @@ import threading
 
 import torch
 
-AHEAD = 8  # projections fetched ahead of the one in use (~one decoder layer, ~25 MB)
+AHEAD = 1  # units (decoder layers) fetched ahead of the one in use
+
+
+class _Unit:
+    """What one host-to-GPU copy brings over: a decoder layer's packed weights when they sit
+    next to each other in host memory (one region, one copy, one event), else one weight."""
+    __slots__ = ("region", "members")
+
+    def __init__(self, region, members):
+        self.region = region  # pinned uint8 host tensor
+        self.members = members  # [(position, byte offset, nbytes, shape)]
 
 
 class WeightStreamer:
     def __init__(self):
         self.host = []  # pinned packed weights, in forward order
         self.index = {}  # host data_ptr -> position
-        self.ready = {}  # position -> (GPU copy, event)
+        self.units = []  # copy units, in forward order
+        self.unit_of = {}  # position -> (unit number, offset, nbytes, shape)
+        self.ready = {}  # unit number -> [GPU buffer, event, waited, uses left]
         self.stream = None
+        self.compute = None  # the compute stream, looked up once per step
         self.installed = False
 
     def install(self, model):
@@ -38,12 +51,15 @@ class WeightStreamer:
         except AttributeError:
             return
         for layer in layers:
+            first = len(self.host)
             for module in layer.modules():
                 weight = getattr(module, "weight", None)
                 state = getattr(weight, "quant_state", None)
                 if (type(module).__name__ != "Linear4bit" or weight is None or state is None
+                        or hasattr(module, "base_layer")  # peft's LoRA wrapper: its base counts
                         or weight.dtype != torch.uint8 or not supported(state)
-                        or not (weight.is_cuda or weight.is_pinned())):
+                        or not (weight.is_cuda or weight.is_pinned())
+                        or (not weight.is_cuda and weight.data_ptr() in self.index)):
                     continue
                 if weight.is_cuda:
                     host = torch.empty(weight.shape, dtype=weight.dtype, pin_memory=True)
@@ -53,35 +69,74 @@ class WeightStreamer:
                 HOSTED.add(host.data_ptr())
                 self.index[host.data_ptr()] = len(self.host)
                 self.host.append(host)
+            self._add_units(range(first, len(self.host)))
         if self.host:
             self.stream = torch.cuda.Stream()
             torch.cuda.empty_cache()  # the freed weights leave the GPU, not just the allocator
 
-    def new_step(self):
-        """Before each training forward: the first layer's projections start coming over."""
-        self.ready = {}
-        for position in range(AHEAD):
-            self._fetch(position)
-
-    def _fetch(self, position):
-        if not 0 <= position < len(self.host) or position in self.ready:
+    def _add_units(self, positions):
+        """One unit for the positions when their weights form one region of the host block
+        (loading takes them from it one after the other), else one unit per weight."""
+        positions = list(positions)
+        if not positions:
             return
-        compute = torch.cuda.current_stream()
-        host = self.host[position]
-        gpu = torch.empty(host.shape, dtype=host.dtype, device=compute.device)
+        block = HOST_BLOCK.block if HOST_BLOCK is not None else None
+        spans = [(self.host[p].data_ptr(), self.host[p].numel()) for p in positions]
+        low = min(ptr for ptr, _ in spans)
+        high = max(ptr + n for ptr, n in spans)
+        total = sum(n for _, n in spans)
+        if block is not None and len(positions) > 1:
+            base = block.data_ptr()
+            inside = all(base <= ptr and ptr + n <= base + block.numel() for ptr, n in spans)
+            if inside and high - low <= total + 1024 * len(positions):
+                region = block[low - base:high - base]
+                members = [(p, ptr - low, n, tuple(self.host[p].shape))
+                           for p, (ptr, n) in zip(positions, spans)]
+                self._register(_Unit(region, members))
+                return
+        for p in positions:
+            host = self.host[p]
+            self._register(_Unit(host.view(-1).view(torch.uint8),
+                                 [(p, 0, host.numel(), tuple(host.shape))]))
+
+    def _register(self, unit):
+        number = len(self.units)
+        self.units.append(unit)
+        for position, offset, nbytes, shape in unit.members:
+            self.unit_of[position] = (number, offset, nbytes, shape)
+
+    def _ensure_units(self):
+        if len(self.unit_of) < len(self.host):  # weights added without install (tests)
+            self._add_units(p for p in range(len(self.host)) if p not in self.unit_of)
+
+    def new_step(self):
+        """Before each training forward: the first layer's weights start coming over."""
+        self.ready = {}
+        self._ensure_units()
+        if self.host:
+            self.compute = torch.cuda.current_stream()
+            for number in range(AHEAD + 1):
+                self._fetch(number)
+
+    def _fetch(self, number):
+        if not 0 <= number < len(self.units) or number in self.ready:
+            return
+        compute = self.compute if self.compute is not None else torch.cuda.current_stream()
+        unit = self.units[number]
+        gpu = torch.empty(unit.region.shape, dtype=torch.uint8, device=compute.device)
         queued = torch.cuda.Event()
         queued.record(compute)  # the buffer may reuse memory the queued compute still reads
+        done = torch.cuda.Event()
         with torch.cuda.stream(self.stream):
             self.stream.wait_event(queued)
-            gpu.copy_(host, non_blocking=True)
-            done = torch.cuda.Event()
+            gpu.copy_(unit.region, non_blocking=True)
             done.record(self.stream)
-        self.ready[position] = (gpu, done)
+        self.ready[number] = [gpu, done, False, len(unit.members)]
 
     def prefetch_backward(self):
-        """Before the backward pass: its first projections are the last layer's."""
-        for position in range(len(self.host) - 1, len(self.host) - 1 - AHEAD, -1):
-            self._fetch(position)
+        """Before the backward pass: its first weights are the last layer's."""
+        for number in range(len(self.units) - 1, len(self.units) - 2 - AHEAD, -1):
+            self._fetch(number)
 
     def get(self, packed):
         """The GPU copy of a packed weight (the tensor itself when it is not streamed)."""
@@ -90,13 +145,21 @@ class WeightStreamer:
         position = self.index.get(packed.data_ptr())
         if position is None:
             return packed.cuda()
+        self._ensure_units()
+        number, offset, nbytes, shape = self.unit_of[position]
         step = 1 if torch._C._current_graph_task_id() == -1 else -1  # forward or backward
-        self._fetch(position)
+        self._fetch(number)
         for ahead in range(1, AHEAD + 1):
-            self._fetch(position + step * ahead)
-        gpu, done = self.ready.pop(position)
-        torch.cuda.current_stream().wait_event(done)
-        return gpu
+            self._fetch(number + step * ahead)
+        entry = self.ready[number]
+        if not entry[2]:
+            compute = self.compute if self.compute is not None else torch.cuda.current_stream()
+            compute.wait_event(entry[1])
+            entry[2] = True
+        entry[3] -= 1
+        if entry[3] <= 0:  # every weight of the unit taken: its buffer goes with the last view
+            del self.ready[number]
+        return entry[0][offset:offset + nbytes].view(shape)
 
 
 STREAMER = WeightStreamer()

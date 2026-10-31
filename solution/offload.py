@@ -72,6 +72,7 @@ class Offloader:
         self.in_flight_bytes = 0
         self.armed = False
         self.layer = None  # the decoder layer whose forward is running (layer_offload)
+        self.compute = None  # the compute stream, looked up once per step
         self.seen = {}  # this step's packed tensors, so a tensor saved twice is copied once
         self.pending = []  # the running layer's saved tensors, copied together when it ends
         self.pending_entry = None
@@ -119,6 +120,13 @@ class Offloader:
         if nbytes:
             self._reserve_quietly(nbytes)  # if pinning fails, the step runs without offloading
         self.armed = self.arena is not None
+        self.compute = torch.cuda.current_stream() if torch.cuda.is_available() else None
+
+    def _compute(self, device):
+        compute = self.compute
+        if compute is None or compute.device != device:
+            compute = torch.cuda.current_stream(device)
+        return compute
 
     def active(self, gate):
         return (self.armed and gate.is_cuda and torch.is_grad_enabled()
@@ -155,7 +163,7 @@ class Offloader:
         if self.stream is None:
             self.stream = torch.cuda.Stream(device=entry.device)
         ready = torch.cuda.Event()
-        ready.record(torch.cuda.current_stream(entry.device))
+        ready.record(self._compute(entry.device))
         views, offset = [], 0
         for t, n in zip(tensors, sizes):
             views.append(host[offset:offset + n].view(t.dtype).as_strided(t.shape, t.stride()))
@@ -227,7 +235,7 @@ class Offloader:
     def _fetch(self, entry):
         """Copy an entry back to the GPU on the copy stream. The buffers are allocated in the
         compute stream's order, and the copy starts after the compute work queued so far."""
-        compute = torch.cuda.current_stream(entry.device)
+        compute = self._compute(entry.device)
         back = tuple(torch.empty_strided(shape, stride, dtype=dtype, device=entry.device)
                      for shape, stride, dtype in entry.specs)
         ready = torch.cuda.Event()
@@ -251,7 +259,7 @@ class Offloader:
                     self._fetch_group(entry.group)
                 if entry.back is None:  # not in a group
                     self._fetch(entry)
-            torch.cuda.current_stream(entry.device).wait_event(entry.fetched)
+            self._compute(entry.device).wait_event(entry.fetched)
             tensors = tuple(entry.back)
         entry.gpu = entry.back = None
         if entry.host is None:  # it stayed on the GPU: a second load needs it again
@@ -298,7 +306,7 @@ class Offloader:
             if entry.back is None:
                 self._fetch(entry)
         if not entry.waited:
-            torch.cuda.current_stream(entry.device).wait_event(entry.fetched)
+            self._compute(entry.device).wait_event(entry.fetched)
             entry.waited = True
             if entry.group is not None:
                 self._fetch_group(entry.group - 1)  # the previous layer starts coming back
