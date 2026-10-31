@@ -252,12 +252,22 @@ class FusedInt8HeadCE(torch.autograd.Function):
         logits_buf = torch.empty((n, min(TILE_V, vocab)), device=device, dtype=torch.float16) \
             if n else None
         tiles = _Tiles(q, device)
+        labels = ordered_target[:n_grad]
+        # W[target] of each labelled row, picked from the tile that holds it (no gather from a
+        # host table, no wait): the same dequantized values as the head's own tile
+        target_rows = torch.zeros((n_grad, width), device=device, dtype=torch.float32) \
+            if n_grad else None
         for index in range(n_tiles):
             start = index * TILE_V
             stop = min(vocab, start + TILE_V)
             w = dequant_rows(tiles.get(index, start, stop), scale[start:stop],
                              tile[: stop - start])
             tiles.release(index)
+            if n_grad:
+                local = labels - start
+                inside = ((local >= 0) & (local < stop - start)).unsqueeze(1)
+                picked = w.index_select(0, local.clamp(0, stop - start - 1))
+                target_rows.add_(picked.float().mul_(inside))
             if n:
                 logits = logits_buf[:, : stop - start]
                 torch.matmul(x16, w.t(), out=logits)
@@ -286,9 +296,7 @@ class FusedInt8HeadCE(torch.autograd.Function):
         if n_grad:
             # d loss_row / d x = softmax @ W - W[target]; the running max ends at the row's max,
             # so acc / total is softmax @ W
-            labels = ordered_target[:n_grad]
-            target_rows = dequant_rows(q.index_select(0, labels), scale.index_select(0, labels))
-            grad = (acc / total[:n_grad, None] - target_rows.float()) * coef
+            grad = (acc / total[:n_grad, None] - target_rows) * coef
 
         def unorder(values):
             return torch.empty_like(values).index_copy_(0, order, values)

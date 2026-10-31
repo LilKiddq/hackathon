@@ -14,6 +14,7 @@ Two class patches, both looked up at call time:
   Soup itself uses for its chunked loss (#1693), so rewind.jsonl keeps the same rows and values.
 """
 
+import atexit
 import types
 
 import torch
@@ -25,6 +26,29 @@ from .fused_ce import IGNORE_INDEX, fused_lm_head_ce
 from .head8 import Int8Embedding, dequant_rows, fused_int8_head_ce, quantize_rows
 
 STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR, read by rewind
+
+
+_PEAKS = []  # (where, MiB): each point where the allocator's peak had grown since the last one
+_STEP = [0]
+
+
+def _note_peak(where):
+    """Reads the allocator's peak (a host-side counter: no sync, nothing reset)."""
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        peak = torch.cuda.max_memory_allocated() >> 20
+        if not _PEAKS or peak > _PEAKS[-1][1]:
+            _PEAKS.append((where, peak))
+
+
+def _report_peaks():
+    if _PEAKS:
+        import sys
+
+        print("[solution] allocator peak grew at: "
+              + " | ".join(f"{where} {mib} MiB" for where, mib in _PEAKS[-12:]), file=sys.stderr)
+
+
+atexit.register(_report_peaks)
 
 
 def _fp16_weight(module):
@@ -68,6 +92,7 @@ def _fused_forward(self, original, input_ids=None, attention_mask=None, position
     else:
         denominator = torch.tensor(num_items_in_batch, device=hidden.device)
 
+    _note_peak(f"step {_STEP[0]} forward")
     offload.OFFLOADER.release_all()  # the last layers' MLP pairs leave the GPU before the head
     int8 = getattr(self, "_kc_int8", None)
     if int8 is not None:  # the tied weight held as int8 rows (head8.py)
@@ -80,6 +105,7 @@ def _fused_forward(self, original, input_ids=None, attention_mask=None, position
             flat_target.index_select(0, rows), denominator.float())
     offload.OFFLOADER.prefetch_last()  # and the last one comes back while the backward starts
     STREAMER.prefetch_backward()  # as do the last layer's weights
+    _note_peak(f"step {_STEP[0]} head")
 
     def scatter(values, dtype):
         full = torch.zeros(batch * seq, device=hidden.device, dtype=dtype)
@@ -151,6 +177,8 @@ def patch_sft_trainer():
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)
 
+        _note_peak(f"step {_STEP[0]} backward/optimizer")
+        _STEP[0] += 1
         warmup.wait()  # the background compilation (warmup.py) is done before the first step
         max_tokens = (getattr(self.args, "per_device_train_batch_size", 0) or 0) * \
             (getattr(self.args, "max_length", 0) or 0) or inputs["input_ids"].numel()
@@ -358,6 +386,7 @@ def patch_soup_setup():
                 trainable_to_gpu(model)
             _fp16_tied_embedding(model)
             _int8_tied_embedding(model)
+            _note_peak("setup")
         return result
 
     _setup_transformers._kc_patched = True
