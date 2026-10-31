@@ -62,7 +62,8 @@ RoPE также отключает FMA и сохраняет промежуто�
 вся работа велась в https://github.com/LilKiddq/hackathon. 31 октября вся история перенесена сюда целиком — все
 коммиты с исходными датами, авторами и сообщениями, без переписывания; дальше работа идёт только здесь.
 Публичный Kaggle-ноутбук финального прогона (коммит `28b3a68`): https://www.kaggle.com/code/narimanbolatuly/notebook0627412735.
-Финальный коммит и остальные ссылки — в [SUBMISSION.md](SUBMISSION.md). Презентация: [docs/presentation.pdf](docs/presentation.pdf).
+Финальный коммит и остальные ссылки — в [SUBMISSION.md](SUBMISSION.md).
+Видео: https://youtu.be/9l_tnI4UKt0 · Презентация: https://drive.google.com/file/d/1UOJRMKyuMqFC15Ceu5jvA5J6Dvp9whHT/view?usp=sharing
 
 ```bash
 python task/prepare_data.py

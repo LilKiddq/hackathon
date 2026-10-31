@@ -10,8 +10,8 @@
 - Публичный прогон Kaggle (клон репозитория команды, коммит 28b3a68, `--repeats 2`): база 77,8 с, решение 51,1 с,
   **1,522×**; 14 345 → 735 MiB, **19,517×**; eval loss −0,017 %; ALL CHECKS PASSED; 57 passed
 - Kaggle, публичный ноутбук финального прогона: https://www.kaggle.com/code/narimanbolatuly/notebook0627412735
-- Demo video, до 3 минут: TBD.
-- Presentation: [docs/presentation.pdf](docs/presentation.pdf) (10 слайдов; текст для озвучки — в заметках к слайдам)
+- Demo video: https://youtu.be/9l_tnI4UKt0
+- Presentation: https://drive.google.com/file/d/1UOJRMKyuMqFC15Ceu5jvA5J6Dvp9whHT/view?usp=sharing
 
 ## Team (до 4 человек)
 
@@ -48,7 +48,7 @@ SwiGLU — пример организаторов, не собственный 
 - [x] Публичный Kaggle-ноутбук финального прогона добавлен.
 - [x] Название команды и четыре участника заполнены.
 - [x] Роли и профили заполнены.
-- [ ] Видео и презентация добавлены.
+- [x] Видео и презентация добавлены.
 - [x] Код в репозитории команды от организаторов (BAITC-Hacks/hack-0e0f2cfa-kuchbrtna), история перенесена целиком.
 
 ## Limitations
