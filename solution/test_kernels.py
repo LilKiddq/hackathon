@@ -517,6 +517,48 @@ def test_row_attention_recomputed_in_backward_matches():
         torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
 
 
+def test_fused_mlp_matches_the_module_path():
+    """mlp.FusedMLP (one autograd node for the MLP) against the same math done op by op: the same
+    output, and input gradients within fp16 rounding."""
+    import bitsandbytes as bnb
+    from solution.mlp import FusedMLP, _fusable
+    from solution.nf4 import dequantize_nf4
+
+    torch.manual_seed(7)
+    hidden, inter, tokens = 256, 512, 300
+
+    def layer(n_in, n_out):
+        module = bnb.nn.Linear4bit(n_in, n_out, bias=False, compute_dtype=torch.float16,
+                                   quant_type="nf4", compress_statistics=True)
+        module.weight = bnb.nn.Params4bit((torch.randn(n_out, n_in) * 0.05).half(),
+                                          requires_grad=False, quant_type="nf4",
+                                          compress_statistics=True)
+        return module.cuda()
+
+    mlp = type("MLP", (), {})()
+    mlp.gate_proj, mlp.up_proj, mlp.down_proj = layer(hidden, inter), layer(hidden, inter), \
+        layer(inter, hidden)
+    x = torch.randn(1, tokens, hidden, device="cuda", requires_grad=True)
+    grad = torch.randn(1, tokens, hidden, device="cuda", dtype=torch.float16)
+    assert _fusable(mlp, x)
+
+    def w(module):
+        return dequantize_nf4(module.weight, module.weight.quant_state)
+
+    x16 = x.to(torch.float16)
+    gate = torch.nn.functional.linear(x16, w(mlp.gate_proj))
+    up = torch.nn.functional.linear(x16, w(mlp.up_proj))
+    ref = torch.nn.functional.linear(torch.nn.functional.silu(gate.float()).mul(up.float()).half(),
+                                     w(mlp.down_proj))
+    ref.backward(grad)
+    ref_grad, x.grad = x.grad, None
+    out = FusedMLP.apply(x, mlp.gate_proj, mlp.up_proj, mlp.down_proj)
+    out.backward(grad)
+    torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
+    assert x.grad.dtype == torch.float32
+    torch.testing.assert_close(x.grad, ref_grad, rtol=5e-3, atol=5e-3)
+
+
 def test_warmup_leaves_the_global_rng_alone():
     from solution import warmup
 

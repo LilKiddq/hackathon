@@ -26,7 +26,7 @@ import triton.language as tl
 
 from .fused_ce import IGNORE_INDEX, NEG
 
-TILE_V = 8192  # vocabulary rows per tile: 8192 x 1536 fp16 = 25 MB, logits n x 8192
+TILE_V = 16384  # vocabulary rows per tile: 16384 x 1536 fp16 = 50 MB, logits n x 16384
 BLOCK_V = 2048
 BLOCK_H = 2048
 SLICE = 8192  # rows quantized at a time: 8192 x 1536 fp32 = 50 MB

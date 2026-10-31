@@ -14,14 +14,77 @@ value cast to fp32 and back is unchanged, so only the copies go away, not precis
 """
 
 import torch
+import triton
 
+from .nf4 import dequantize_nf4, supported
 from .offload import swiglu_maybe_offloaded
+from .swiglu import BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 from .swiglu import swiglu  # the example's SwiGLU kernel; it does not count as ours
+from .wstream import STREAMER
 
 
 def _fp16_4bit(module):
     return getattr(module, "compute_dtype", None) == torch.float16 and \
         type(module).__name__ == "Linear4bit"
+
+
+def _weight(module):
+    """The fp16 weight of a 4-bit projection (streamed in from the host by wstream.py)."""
+    weight = module.weight
+    return dequantize_nf4(STREAMER.get(weight), weight.quant_state, torch.float16)
+
+
+class FusedMLP(torch.autograd.Function):
+    """The whole Qwen2 MLP in training as one autograd node: down(silu(gate(x)) * up(x)).
+
+    The same kernels and matmuls as the module path (NF4 dequantization, cuBLAS, the example's
+    SwiGLU kernels), so the same numbers: x is cast to fp16 once (each 4-bit layer cast it on its
+    own), and gate and up are kept for the backward pass (offloaded with the layer, offload.py).
+    One Python node instead of three Linear4bit -> matmul_4bit -> NF4Linear chains, a SwiGLU node
+    and two casts, both ways: the step is limited by the CPU launching work, not by the GPU."""
+
+    @staticmethod
+    def forward(ctx, x, gate_proj, up_proj, down_proj):
+        x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+        flat = x16.reshape(-1, x16.shape[-1])
+        gate = torch.nn.functional.linear(flat, _weight(gate_proj))
+        up = torch.nn.functional.linear(flat, _weight(up_proj))
+        act = torch.empty_like(gate)
+        n = gate.numel()
+        example_swiglu_fwd_kernel[(triton.cdiv(n, BLOCK),)](gate, up, act, n, BLOCK=BLOCK)
+        out = torch.nn.functional.linear(act, _weight(down_proj))
+        ctx.save_for_backward(gate, up)
+        ctx.modules, ctx.x_dtype, ctx.x_shape = (gate_proj, up_proj, down_proj), x.dtype, x.shape
+        return out.view(*x.shape[:-1], out.shape[-1])
+
+    @staticmethod
+    def backward(ctx, grad):
+        gate, up = ctx.saved_tensors
+        gate_proj, up_proj, down_proj = ctx.modules
+        flat = grad.reshape(-1, grad.shape[-1]).to(torch.float16)
+        dact = flat @ _weight(down_proj)  # backward order: down, up, gate (wstream's window)
+        dgate, dup = torch.empty_like(gate), torch.empty_like(up)
+        n = gate.numel()
+        example_swiglu_bwd_kernel[(triton.cdiv(n, BLOCK),)](dact, gate, up, dgate, dup, n,
+                                                           BLOCK=BLOCK)
+        del dact
+        # as the module path: each input gradient in fp16, the two summed in x's dtype
+        dx = (dup @ _weight(up_proj)).to(ctx.x_dtype)
+        dx.add_(dgate @ _weight(gate_proj))
+        return dx.view(ctx.x_shape), None, None, None
+
+
+def _fusable(mlp, x):
+    if not (x.is_cuda and x.dtype in (torch.float32, torch.float16) and x.requires_grad
+            and torch.is_grad_enabled()):
+        return False
+    for module in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        weight = getattr(module, "weight", None)
+        state = getattr(weight, "quant_state", None)
+        if (not _fp16_4bit(module) or getattr(module, "bias", None) is not None
+                or state is None or weight.dtype != torch.uint8 or not supported(state)):
+            return False
+    return True
 
 
 def patch_qwen2_mlp_fp16():
@@ -34,6 +97,8 @@ def patch_qwen2_mlp_fp16():
 
     def forward(self, x):
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
+        if act == "silu" and _fusable(self, x):
+            return FusedMLP.apply(x, self.gate_proj, self.up_proj, self.down_proj)
         if (act != "silu" or not x.is_cuda or x.dtype != torch.float32
                 or not all(_fp16_4bit(m) for m in (self.gate_proj, self.up_proj, self.down_proj))):
             return original(self, x)
