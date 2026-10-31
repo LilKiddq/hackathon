@@ -617,8 +617,8 @@ def test_layer_batched_weight_streaming_gives_the_same_results():
 
 def test_layer_streaming_dequantized_whole_gives_the_same_results():
     """wstream with each 'layer' (4 weights in one region) dequantized in one launch into the one
-    kept fp16 buffer, its packed bytes in the one kept packed buffer (the next layer's copy goes
-    into it after the launch): the same results bit for bit, forward and backward, over steps."""
+    kept fp16 buffer, its packed bytes in kept packed buffers taken in turn: the same results bit
+    for bit, forward and backward, over steps."""
     import types
 
     import bitsandbytes.functional as F
@@ -667,7 +667,7 @@ def test_layer_streaming_dequantized_whole_gives_the_same_results():
                 out = run(hosts)
                 torch.testing.assert_close(out[0], ref[0], rtol=0, atol=0)
                 torch.testing.assert_close(out[1], ref[1], rtol=0, atol=0)
-            assert len(streamer.spare) == 1  # one packed buffer served every layer
+            assert len(streamer.spare) <= ws.AHEAD + 1  # the same kept buffers every layer
         finally:
             nf4.STREAMER = saved
     finally:

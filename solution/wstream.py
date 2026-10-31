@@ -141,16 +141,13 @@ class WeightStreamer:
         self._ensure_units()
         if self.host:
             self.compute = torch.cuda.current_stream()
-            self._fetch(0)
-            self._fetch_ahead(0, 1)
+            for number in range(AHEAD + 1):
+                self._fetch(number)
 
     def _fetch_ahead(self, number, step):
-        """Start copying the units after `number` in the pass's direction. A unit dequantized
-        whole (one launch) asks for them only after its launch, so the next unit's bytes go into
-        the buffer this one's have just left: one packed buffer serves the whole run."""
-        if number not in self.metas or self.ready.get(number, [None] * 5)[4] is not None:
-            for ahead in range(1, AHEAD + 1):
-                self._fetch(number + step * ahead)
+        """Start copying the next AHEAD units in the pass's direction (into the kept buffers)."""
+        for ahead in range(1, AHEAD + 1):
+            self._fetch(number + step * ahead)
 
     def _fetch(self, number):
         if not 0 <= number < len(self.units) or number in self.ready:
@@ -199,9 +196,8 @@ class WeightStreamer:
 
     def prefetch_backward(self):
         """Before the backward pass: its first weights are the last layer's."""
-        last = len(self.units) - 1
-        self._fetch(last)
-        self._fetch_ahead(last, -1)
+        for number in range(len(self.units) - 1, len(self.units) - 2 - AHEAD, -1):
+            self._fetch(number)
 
     def get(self, packed):
         """The GPU copy of a packed weight (the tensor itself when it is not streamed)."""
@@ -250,6 +246,7 @@ class WeightStreamer:
             return dequantize_nf4(self.get(packed), quant_state, dtype)
         step = 1 if torch._C._current_graph_task_id() == -1 else -1  # forward or backward
         self._fetch(number)
+        self._fetch_ahead(number, step)
         entry = self.ready[number]
         if entry[4] is not None and self.unit_owner != number:  # overwritten by another unit
             del self.ready[number]
@@ -262,7 +259,6 @@ class WeightStreamer:
             self.unit_owner = number
             entry[0] = None  # the packed copy is not needed any more
             self._give_back(entry)
-        self._fetch_ahead(number, step)  # into the buffer just given back
         weights = entry[4]
         entry[3] -= 1
         if entry[3] <= 0:
