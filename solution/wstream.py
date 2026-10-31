@@ -159,37 +159,86 @@ def reserve_weight_block(config):
     return lambda: HOST_BLOCK.reserve(layers * (per_layer + 7 * 512) + vocab * hidden + 512)
 
 
+EMBEDDING_ON_HOST = [False]  # set when loading put the tied embedding in host memory
+LOADED_TO_HOST = [0]  # 4-bit weights loading put in host memory
+
+
+def _is_gpu(device):
+    if isinstance(device, torch.device):
+        return device.type == "cuda"
+    if isinstance(device, int):
+        return device >= 0
+    return isinstance(device, str) and (device.startswith("cuda") or device.isdigit())
+
+
+@contextlib.contextmanager
+def _patched(module, name, replacement):
+    original = getattr(module, name, None)
+    if original is None:
+        yield None
+        return
+    setattr(module, name, replacement(original))
+    try:
+        yield original
+    finally:
+        setattr(module, name, original)
+
+
 @contextlib.contextmanager
 def weights_to_host_while_loading():
-    """While Soup loads the model: each 4-bit weight goes to pinned host memory as soon as
-    bitsandbytes has quantized it on the GPU, so the packed weights never all sit on the GPU
-    together (that, next to the embedding, was the run's memory peak during setup)."""
-    try:
-        import bitsandbytes
-        cls = bitsandbytes.nn.Params4bit
-        original = cls._quantize
-    except Exception:  # noqa: BLE001 - another bitsandbytes: weights move at the first step
-        yield []
-        return
+    """While Soup loads the model, nothing large stays on the GPU:
+
+    - each 4-bit weight goes to pinned host memory as soon as bitsandbytes has quantized it on
+      the GPU, so the packed weights never sit on the GPU together;
+    - the tied embedding (fp16, 467 MB) is loaded into host memory instead of the GPU; it becomes
+      the int8 host table at the end of setup (head8.py), passing through the GPU in slices;
+    - transformers' caching-allocator warm-up is skipped: it allocates (and the allocator then
+      keeps) one block the size of the whole model up front, only to make the later per-weight
+      allocations faster. Here those weights do not stay on the GPU, so the block would only be
+      the run's memory peak (~1.07 GB). Loading itself is unchanged."""
     hosted = []
+    with contextlib.ExitStack() as stack:
+        try:
+            import bitsandbytes
 
-    def _quantize(self, device):
-        result = original(self, device)
-        data = result.data
-        if data.is_cuda and data.dtype == torch.uint8:
-            host = HOST_BLOCK.take(data.numel()) if HOST_BLOCK is not None else None
-            host = host.view(data.shape) if host is not None else \
-                torch.empty(data.shape, dtype=data.dtype, pin_memory=True)  # noqa: E501
-            host.copy_(data)
-            result.data = host
-            hosted.append(host.data_ptr())
-        return result
+            def quantize(original):
+                def _quantize(self, device):
+                    result = original(self, device)
+                    data = result.data
+                    if data.is_cuda and data.dtype == torch.uint8:
+                        host = HOST_BLOCK.take(data.numel()) if HOST_BLOCK is not None else None
+                        host = host.view(data.shape) if host is not None else \
+                            torch.empty(data.shape, dtype=data.dtype, pin_memory=True)
+                        host.copy_(data)
+                        result.data = host
+                        hosted.append(host.data_ptr())
+                    return result
+                return _quantize
 
-    cls._quantize = _quantize
-    try:
-        yield hosted
-    finally:
-        cls._quantize = original
+            stack.enter_context(_patched(bitsandbytes.nn.Params4bit, "_quantize", quantize))
+        except Exception:  # noqa: BLE001 - another bitsandbytes: weights move at the first step
+            pass
+        try:
+            from transformers import core_model_loading, modeling_utils
+
+            def get_device(original):
+                def _get_device(device_map, param_name, *args, **kwargs):
+                    device = original(device_map, param_name, *args, **kwargs)
+                    if str(param_name).endswith("embed_tokens.weight") and _is_gpu(device):
+                        EMBEDDING_ON_HOST[0] = True
+                        return torch.device("cpu") if isinstance(device, torch.device) else "cpu"
+                    return device
+                return _get_device
+
+            stack.enter_context(_patched(core_model_loading, "get_device", get_device))
+            stack.enter_context(_patched(modeling_utils, "caching_allocator_warmup",
+                                         lambda original: lambda *args, **kwargs: None))
+        except Exception:  # noqa: BLE001 - another transformers: the usual loading
+            pass
+        try:
+            yield hosted
+        finally:
+            LOADED_TO_HOST[0] += len(hosted)
 
 
 def trainable_to_gpu(model):

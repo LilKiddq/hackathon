@@ -101,17 +101,18 @@ def head_partial_kernel(logits_ptr, stride, target_ptr, part_ptr, best_idx_ptr, 
                 tl.store(row_ptr + cols, tl.exp(x - new_max).to(tl.float16), mask=valid)
 
 
-def quantize_rows(weight, out=None):
+def quantize_rows(weight, out=None, device=None):
     """int8 rows with one fp32 absmax scale each (round to nearest). In slices of SLICE rows, so
     no full-size fp32 copy of the weight ever exists (that would be the run's memory peak).
-    `out` (e.g. a pinned host tensor) receives the int8 rows instead of a new GPU tensor; the
-    scales stay with the weight."""
+    `out` (e.g. a pinned host tensor) receives the int8 rows instead of a new tensor; `device`
+    (default: the weight's) computes them and keeps the scales, so a weight in host memory is
+    quantized on the GPU one slice at a time."""
     rows = weight.shape[0]
-    q = out if out is not None else \
-        torch.empty(weight.shape, dtype=torch.int8, device=weight.device)
-    scale = torch.empty(rows, dtype=torch.float32, device=weight.device)
+    device = torch.device(device) if device is not None else weight.device
+    q = out if out is not None else torch.empty(weight.shape, dtype=torch.int8, device=device)
+    scale = torch.empty(rows, dtype=torch.float32, device=device)
     for start in range(0, rows, SLICE):
-        part = weight[start:start + SLICE].float()
+        part = weight[start:start + SLICE].to(device).float()
         part_scale = part.abs().amax(dim=1).clamp_(min=1e-12).div_(127.0)
         scale[start:start + SLICE] = part_scale
         q[start:start + SLICE].copy_(part.div_(part_scale[:, None]).round_().clamp_(-127, 127)

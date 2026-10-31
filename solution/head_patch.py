@@ -44,8 +44,13 @@ def _report_peaks():
     if _PEAKS:
         import sys
 
+        from .wstream import EMBEDDING_ON_HOST, LOADED_TO_HOST
+
         print("[solution] allocator peak grew at: "
-              + " | ".join(f"{where} {mib} MiB" for where, mib in _PEAKS[-12:]), file=sys.stderr)
+              + " | ".join(f"{where} {mib} MiB" for where, mib in _PEAKS[-12:])
+              + f" | loading: {LOADED_TO_HOST[0]} 4-bit weights and "
+              + ("the" if EMBEDDING_ON_HOST[0] else "not the") + " embedding to host",
+              file=sys.stderr)
 
 
 atexit.register(_report_peaks)
@@ -217,9 +222,16 @@ def patch_sft_trainer():
 
 
 def _tied_embedding(lm):
+    """The tied embedding / lm_head weight: on the GPU, or in host memory when our loading put it
+    there (wstream.weights_to_host_while_loading)."""
+    from .wstream import EMBEDDING_ON_HOST
+
     embed, head = lm.get_input_embeddings(), lm.lm_head
     weight = getattr(embed, "weight", None)
-    if weight is None or weight is not getattr(head, "weight", None) or not weight.is_cuda:
+    if weight is None or weight is not getattr(head, "weight", None):
+        return None
+    if not (weight.is_cuda or (EMBEDDING_ON_HOST[0] and weight.device.type == "cpu"
+                               and torch.cuda.is_available())):
         return None
     return weight
 
@@ -271,11 +283,13 @@ def _int8_tied_embedding(model):
     # streams them a tile ahead, the embedding gathers its rows on the CPU (head8.py)
     from .wstream import host_bytes
 
+    device = torch.device("cuda", torch.cuda.current_device())
     host = host_bytes(weight.numel())
     q, scale = quantize_rows(weight.detach(), host.view(weight.shape) if host is not None
-                             else None)
-    stand_in = torch.nn.Parameter(weight.new_zeros((1, 1)).expand(weight.shape),
-                                  requires_grad=False)
+                             else None, device=device)
+    stand_in = torch.nn.Parameter(
+        torch.zeros((1, 1), dtype=weight.dtype, device=device).expand(weight.shape),
+        requires_grad=False)
     embed.weight = stand_in
     head.weight = stand_in
     del weight
