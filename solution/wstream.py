@@ -129,9 +129,21 @@ class _HostBlock:
 HOST_BLOCK = None
 
 
+def host_bytes(nbytes):
+    """Pinned host bytes from the block (or pinned on their own when it has no room)."""
+    host = HOST_BLOCK.take(nbytes) if HOST_BLOCK is not None else None
+    if host is None:
+        try:
+            host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        except Exception:  # noqa: BLE001 - no pinned memory: the caller keeps its GPU copy
+            return None
+    return host.view(torch.int8)
+
+
 def reserve_weight_block(config):
     """Start-of-setup: the packed weights' total size from the checkpoint's config.json (all
-    projections are NF4, two weights per byte), reserved by the offload pinning thread."""
+    projections are NF4, two weights per byte), plus the int8 embedding / head table (one byte
+    per weight, head8.py), reserved by the offload pinning thread."""
     global HOST_BLOCK
     layers = getattr(config, "num_hidden_layers", 0) or 0
     hidden = getattr(config, "hidden_size", 0) or 0
@@ -142,8 +154,9 @@ def reserve_weight_block(config):
         return None
     head_dim = getattr(config, "head_dim", None) or hidden // heads
     per_layer = (2 * heads * head_dim * hidden + 2 * kv * head_dim * hidden + 3 * inter * hidden) // 2
+    vocab = getattr(config, "vocab_size", 0) or 0
     HOST_BLOCK = _HostBlock()
-    return lambda: HOST_BLOCK.reserve(layers * (per_layer + 7 * 512))
+    return lambda: HOST_BLOCK.reserve(layers * (per_layer + 7 * 512) + vocab * hidden + 512)
 
 
 @contextlib.contextmanager
@@ -166,7 +179,7 @@ def weights_to_host_while_loading():
         if data.is_cuda and data.dtype == torch.uint8:
             host = HOST_BLOCK.take(data.numel()) if HOST_BLOCK is not None else None
             host = host.view(data.shape) if host is not None else \
-                torch.empty(data.shape, dtype=data.dtype, pin_memory=True)
+                torch.empty(data.shape, dtype=data.dtype, pin_memory=True)  # noqa: E501
             host.copy_(data)
             result.data = host
             hosted.append(host.data_ptr())

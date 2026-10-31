@@ -101,20 +101,94 @@ def head_partial_kernel(logits_ptr, stride, target_ptr, part_ptr, best_idx_ptr, 
                 tl.store(row_ptr + cols, tl.exp(x - new_max).to(tl.float16), mask=valid)
 
 
-def quantize_rows(weight):
+def quantize_rows(weight, out=None):
     """int8 rows with one fp32 absmax scale each (round to nearest). In slices of SLICE rows, so
-    no full-size fp32 copy of the weight ever exists (that would be the run's memory peak)."""
+    no full-size fp32 copy of the weight ever exists (that would be the run's memory peak).
+    `out` (e.g. a pinned host tensor) receives the int8 rows instead of a new GPU tensor; the
+    scales stay with the weight."""
     rows = weight.shape[0]
-    q = torch.empty(weight.shape, dtype=torch.int8, device=weight.device)
+    q = out if out is not None else \
+        torch.empty(weight.shape, dtype=torch.int8, device=weight.device)
     scale = torch.empty(rows, dtype=torch.float32, device=weight.device)
     for start in range(0, rows, SLICE):
         part = weight[start:start + SLICE].float()
         part_scale = part.abs().amax(dim=1).clamp_(min=1e-12).div_(127.0)
         scale[start:start + SLICE] = part_scale
-        q[start:start + SLICE] = part.div_(part_scale[:, None]).round_().clamp_(-127, 127) \
-            .to(torch.int8)
+        q[start:start + SLICE].copy_(part.div_(part_scale[:, None]).round_().clamp_(-127, 127)
+                                     .to(torch.int8))
         del part
     return q, scale
+
+
+_COPY_STREAMS = {}
+_STAGING = {}
+
+
+def _copy_stream(device):
+    stream = _COPY_STREAMS.get(device)
+    if stream is None:
+        stream = _COPY_STREAMS[device] = torch.cuda.Stream(device=device)
+    return stream
+
+
+def _host_rows(q, flat):
+    """Rows of a pinned host table for GPU ids: gathered on the CPU into a pinned staging
+    buffer, then one copy to the GPU. Reading the ids waits for the stream, so the previous
+    call's copy out of the staging buffer is finished before it is overwritten."""
+    ids = flat.to("cpu")
+    count = ids.numel()
+    staging = _STAGING.get(q.data_ptr())
+    if staging is None or staging.shape[0] < count:
+        staging = torch.empty((max(count, 2048), q.shape[1]), dtype=q.dtype, pin_memory=True)
+        _STAGING[q.data_ptr()] = staging
+    torch.index_select(q, 0, ids, out=staging[:count])
+    return staging[:count].to(flat.device, non_blocking=True)
+
+
+class _Tiles:
+    """The head's vocabulary tiles of int8 rows. From a GPU table: slices. From a pinned host
+    table: copied to two GPU buffers on a second stream, the next tile while this one is used,
+    so the copy (12 MB, ~1 ms) hides behind the tile's matmuls."""
+
+    def __init__(self, q, device):
+        self.q, self.vocab = q, q.shape[0]
+        self.host = not q.is_cuda and torch.device(device).type == "cuda"
+        if self.host:
+            self.stream = _copy_stream(device)
+            self.bufs = [torch.empty((min(TILE_V, self.vocab), q.shape[1]), dtype=q.dtype,
+                                     device=device) for _ in range(2)]
+            queued = torch.cuda.Event()
+            queued.record(torch.cuda.current_stream(device))  # the buffers' memory is free
+            self.free = [queued, queued]
+            self.copied = [None, None]
+            self._issue(0)
+
+    def _issue(self, index):
+        start = index * TILE_V
+        if start >= self.vocab:
+            return
+        stop = min(self.vocab, start + TILE_V)
+        slot = index % 2
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_event(self.free[slot])
+            self.bufs[slot][: stop - start].copy_(self.q[start:stop], non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(self.stream)
+        self.copied[slot] = done
+
+    def get(self, index, start, stop):
+        if not self.host:
+            return self.q[start:stop]
+        self._issue(index + 1)  # its buffer was released after tile index - 1
+        slot = index % 2
+        torch.cuda.current_stream().wait_event(self.copied[slot])
+        return self.bufs[slot][: stop - start]
+
+    def release(self, index):
+        if self.host:
+            used = torch.cuda.Event()
+            used.record(torch.cuda.current_stream())
+            self.free[index % 2] = used
 
 
 def dequant_rows(q, scale, out=None):
@@ -132,7 +206,8 @@ class Int8Embedding(torch.autograd.Function):
     @staticmethod
     def forward(ctx, ids, q, scale):
         flat = ids.reshape(-1)
-        rows = dequant_rows(q.index_select(0, flat), scale.index_select(0, flat))
+        picked = q.index_select(0, flat) if q.device == flat.device else _host_rows(q, flat)
+        rows = dequant_rows(picked, scale.index_select(0, flat))
         return rows.float().view(*ids.shape, q.shape[1])
 
     @staticmethod
@@ -176,10 +251,13 @@ class FusedInt8HeadCE(torch.autograd.Function):
         tile = torch.empty((min(TILE_V, vocab), width), device=device, dtype=torch.float16)
         logits_buf = torch.empty((n, min(TILE_V, vocab)), device=device, dtype=torch.float16) \
             if n else None
+        tiles = _Tiles(q, device)
         for index in range(n_tiles):
             start = index * TILE_V
             stop = min(vocab, start + TILE_V)
-            w = dequant_rows(q[start:stop], scale[start:stop], tile[: stop - start])
+            w = dequant_rows(tiles.get(index, start, stop), scale[start:stop],
+                             tile[: stop - start])
+            tiles.release(index)
             if n:
                 logits = logits_buf[:, : stop - start]
                 torch.matmul(x16, w.t(), out=logits)
@@ -190,7 +268,7 @@ class FusedInt8HeadCE(torch.autograd.Function):
                 if n_grad:
                     acc.mul_(alpha[:, None])
                     acc += torch.matmul(logits[:n_grad], w).float()
-        del tile, logits_buf
+        del tile, logits_buf, tiles
 
         top_m = part[..., 0].amax(dim=1, keepdim=True)
         rescale = torch.exp(part[..., 0] - top_m)

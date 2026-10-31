@@ -239,7 +239,13 @@ def _int8_tied_embedding(model):
             or weight.dim() != 2:
         return
     embed, head = lm.get_input_embeddings(), lm.lm_head
-    q, scale = quantize_rows(weight.detach())
+    # the int8 rows live in pinned host memory (233 MB off the GPU for the whole run): the head
+    # streams them a tile ahead, the embedding gathers its rows on the CPU (head8.py)
+    from .wstream import host_bytes
+
+    host = host_bytes(weight.numel())
+    q, scale = quantize_rows(weight.detach(), host.view(weight.shape) if host is not None
+                             else None)
     stand_in = torch.nn.Parameter(weight.new_zeros((1, 1)).expand(weight.shape),
                                   requires_grad=False)
     embed.weight = stand_in
@@ -250,8 +256,9 @@ def _int8_tied_embedding(model):
     def embed_forward(ids):
         return Int8Embedding.apply(ids, q, scale)
 
-    def head_forward(hidden):
-        return functional.linear(hidden.to(torch.float16), dequant_rows(q, scale))
+    def head_forward(hidden):  # any call besides training's fused step: the full table
+        return functional.linear(hidden.to(torch.float16),
+                                 dequant_rows(q.to(hidden.device), scale))
 
     embed.forward = embed_forward
     head.forward = head_forward

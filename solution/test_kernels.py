@@ -51,7 +51,8 @@ def test_rms_norm_matches_pytorch(shape):
     out = rms_norm(x, weight, 1e-6)
     out.backward(grad)
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(x.grad, ref_dx, rtol=1e-4, atol=1e-4)
+    # the backward pass reads x saved in fp16 (an approximation of ~1e-3 relative)
+    torch.testing.assert_close(x.grad, ref_dx, rtol=3e-3, atol=3e-3)
 
 
 @pytest.mark.parametrize("rows,vocab", [(700, 151936), (37, 5000)])
@@ -199,8 +200,9 @@ def test_add_rmsnorm_matches_pytorch(delta_dtype, shape):
     tol = TOLERANCE[delta_dtype]
     torch.testing.assert_close(s2, s, rtol=0, atol=0)
     torch.testing.assert_close(y2, y, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(residual.grad, ref_dr, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(delta.grad, ref_dd, rtol=tol, atol=tol)
+    # the backward pass reads s saved in fp16 (an approximation of ~1e-3 relative)
+    torch.testing.assert_close(residual.grad, ref_dr, rtol=3e-3, atol=3e-3)
+    torch.testing.assert_close(delta.grad, ref_dd, rtol=max(tol, 3e-3), atol=max(tol, 3e-3))
 
 
 def test_rope_fp16_store_under_autocast_matches_cast():
@@ -461,6 +463,35 @@ def test_int8_head_matches_pytorch_on_the_dequantized_weight(rows, vocab):
     assert ((hidden.grad - ref_grad).abs().max() / ref_grad.abs().max()) < 5e-3
     ids = torch.randint(0, vocab, (3, 11), device="cuda")
     torch.testing.assert_close(Int8Embedding.apply(ids, q, scale), w.float()[ids], rtol=0, atol=0)
+
+
+def test_int8_table_in_host_memory_gives_the_same_results():
+    """head8 with the int8 table in pinned host memory (tiles streamed to the GPU, embedding rows
+    gathered on the CPU): bit for bit what the same table on the GPU gives."""
+    from solution.head8 import Int8Embedding, fused_int8_head_ce, quantize_rows
+
+    torch.manual_seed(4)
+    rows, vocab, width = 300, 20000, 256
+    weight = (torch.randn(vocab, width, device="cuda") * 0.05).half()
+    q, scale = quantize_rows(weight)
+    host = torch.empty((vocab, width), dtype=torch.int8, pin_memory=True)
+    q_host, scale_host = quantize_rows(weight, host)
+    assert torch.equal(q_host, q.cpu()) and torch.equal(scale_host, scale)
+    target = torch.randint(0, vocab, (rows,), device="cuda")
+    target[::3] = -100
+    denominator = (target != -100).sum().float()
+    results = []
+    for table in (q, q_host):
+        gen = torch.Generator("cuda").manual_seed(5)
+        hidden = torch.randn(rows, width, device="cuda", generator=gen).requires_grad_()
+        out = fused_int8_head_ce(hidden, table, scale, target, denominator)
+        (out[0] * 1024.0).backward()
+        results.append((out[0].detach(), out[2].detach(), out[3].detach(), hidden.grad))
+    for a, b in zip(*results):  # same inputs, same kernels (a GEMM may pick another algorithm)
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+    ids = torch.randint(0, vocab, (4, 37), device="cuda")
+    torch.testing.assert_close(Int8Embedding.apply(ids, q_host, scale),
+                               Int8Embedding.apply(ids, q, scale), rtol=0, atol=0)
 
 
 def test_warmup_leaves_the_global_rng_alone():

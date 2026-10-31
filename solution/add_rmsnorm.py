@@ -12,8 +12,8 @@ import triton.language as tl
 
 
 @triton.jit(do_not_specialize=["n_cols", "eps"])
-def add_rmsnorm_fwd_kernel(r_ptr, d_ptr, w_ptr, s_ptr, y_ptr, inv_ptr,
-                           n_cols, eps, BLOCK: tl.constexpr):
+def add_rmsnorm_fwd_kernel(r_ptr, d_ptr, w_ptr, s_ptr, y_ptr, inv_ptr, ss_ptr,
+                           n_cols, eps, SAVE_HALF: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     col = tl.arange(0, BLOCK)
     valid = col < n_cols
@@ -26,6 +26,8 @@ def add_rmsnorm_fwd_kernel(r_ptr, d_ptr, w_ptr, s_ptr, y_ptr, inv_ptr,
     tl.store(s_ptr + offset, s, valid)
     tl.store(y_ptr + offset, w * (s * inv), valid)
     tl.store(inv_ptr + row, inv)
+    if SAVE_HALF:  # the copy of s kept for the backward pass
+        tl.store(ss_ptr + offset, s.to(tl.float16), valid)
 
 
 @triton.jit(do_not_specialize=["n_cols", "has_ds", "has_dy"])
@@ -38,7 +40,7 @@ def add_rmsnorm_bwd_kernel(ds_ptr, dy_ptr, s_ptr, w_ptr, inv_ptr,
     offset = row * n_cols + col
     ds = tl.load(ds_ptr + offset, valid & has_ds, other=0).to(tl.float32)
     dy = tl.load(dy_ptr + offset, valid & has_dy, other=0).to(tl.float32)
-    s = tl.load(s_ptr + offset, valid, other=0)
+    s = tl.load(s_ptr + offset, valid, other=0).to(tl.float32)
     w = tl.load(w_ptr + col, valid, other=0)
     inv = tl.load(inv_ptr + row)
     n = s * inv
@@ -60,11 +62,16 @@ class AddRMSNorm(torch.autograd.Function):
         rows = residual.numel() // cols
         inv = torch.empty(rows, device=residual.device, dtype=torch.float32)
         block = triton.next_power_of_2(cols)
+        # training: the backward pass gets s in fp16 (half the bytes to keep or offload; an
+        # approximation of ~1e-3 relative in the gradient, within the task's tolerances)
+        half = torch.is_grad_enabled() and (residual.requires_grad or delta.requires_grad)
+        saved = torch.empty(residual.shape, device=residual.device, dtype=torch.float16) \
+            if half else s
         add_rmsnorm_fwd_kernel[(rows,)](
-            residual, delta, weight, s, y, inv, cols, eps, BLOCK=block,
+            residual, delta, weight, s, y, inv, saved, cols, eps, SAVE_HALF=half, BLOCK=block,
             num_warps=8 if block >= 2048 else 4, enable_fp_fusion=False)
-        ctx.save_for_backward(s, weight, inv)
-        ctx.delta_dtype = delta.dtype
+        ctx.save_for_backward(saved, weight, inv)
+        ctx.delta_dtype, ctx.residual_dtype = delta.dtype, residual.dtype
         ctx.block = block
         ctx.set_materialize_grads(False)
         return s, y
@@ -75,11 +82,11 @@ class AddRMSNorm(torch.autograd.Function):
             return None, None, None, None
         s, weight, inv = ctx.saved_tensors
         cols = s.shape[-1]
-        dr = torch.empty_like(s)
+        dr = torch.empty_like(s, dtype=ctx.residual_dtype)
         dd = torch.empty_like(s, dtype=ctx.delta_dtype)
         add_rmsnorm_bwd_kernel[(s.numel() // cols,)](
-            ds.contiguous() if ds is not None else s,
-            dy.contiguous() if dy is not None else s,
+            ds.contiguous() if ds is not None else dr,
+            dy.contiguous() if dy is not None else dr,
             s, weight, inv, dr, dd, cols, ds is not None, dy is not None,
             BLOCK=ctx.block, num_warps=8 if ctx.block >= 2048 else 4,
             enable_fp_fusion=False)
