@@ -615,6 +615,30 @@ def test_layer_batched_weight_streaming_gives_the_same_results():
         ws.HOST_BLOCK = saved_block
 
 
+def test_layer_dequantized_in_one_launch_matches_bitsandbytes():
+    """nf4.dequantize_unit: several NF4 weights packed back to back, dequantized in one launch,
+    bit for bit what bitsandbytes (and our per-weight kernel) give for each."""
+    import bitsandbytes.functional as F
+    from solution.nf4 import UnitMeta, dequantize_nf4, dequantize_unit
+
+    torch.manual_seed(10)
+    shapes = [(256, 256), (64, 256), (512, 256), (64, 256)]
+    quantized = [F.quantize_4bit((torch.randn(shape, device="cuda") * 0.05).half(), blocksize=64,
+                                 quant_type="nf4", compress_statistics=True) for shape in shapes]
+    sizes = [packed.numel() for packed, _ in quantized]
+    starts = [sum(sizes[:i]) for i in range(len(sizes))]
+    region = torch.cat([packed.reshape(-1) for packed, _ in quantized])
+    states = [state for _, state in quantized]
+    refs = [F.dequantize_4bit(packed, state).half() for packed, state in quantized]
+    assert UnitMeta.fits(states, starts, sizes)
+    meta = UnitMeta(states, starts, region.device)
+    out = dequantize_unit(region, meta)
+    for (rows, cols), start, ref, (packed, state) in zip(shapes, starts, refs, quantized):
+        got = out[2 * start:2 * start + rows * cols].view(rows, cols)
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+        torch.testing.assert_close(dequantize_nf4(packed, state), ref, rtol=0, atol=0)
+
+
 def test_warmup_leaves_the_global_rng_alone():
     from solution import warmup
 

@@ -34,7 +34,9 @@ class WeightStreamer:
         self.index = {}  # host data_ptr -> position
         self.units = []  # copy units, in forward order
         self.unit_of = {}  # position -> (unit number, offset, nbytes, shape)
-        self.ready = {}  # unit number -> [GPU buffer, event, waited, uses left]
+        self.ready = {}  # unit number -> [GPU buffer, event, waited, uses left, fp16 weights]
+        self.states = []  # quant state of each position
+        self.metas = {}  # unit number -> nf4.UnitMeta (one dequantization launch per layer)
         self.stream = None
         self.compute = None  # the compute stream, looked up once per step
         self.installed = False
@@ -69,7 +71,11 @@ class WeightStreamer:
                 HOSTED.add(host.data_ptr())
                 self.index[host.data_ptr()] = len(self.host)
                 self.host.append(host)
+                self.states.append(state)
+            units_before = len(self.units)
             self._add_units(range(first, len(self.host)))
+            if len(self.units) == units_before + 1:
+                self._add_meta(units_before)
         if self.host:
             self.stream = torch.cuda.Stream()
             torch.cuda.empty_cache()  # the freed weights leave the GPU, not just the allocator
@@ -98,6 +104,20 @@ class WeightStreamer:
             host = self.host[p]
             self._register(_Unit(host.view(-1).view(torch.uint8),
                                  [(p, 0, host.numel(), tuple(host.shape))]))
+
+    def _add_meta(self, number):
+        """One dequantization launch for the whole unit, when its weights allow it."""
+        from .nf4 import UnitMeta
+
+        try:
+            members = sorted(self.units[number].members, key=lambda member: member[1])
+            states = [self.states[position] for position, _, _, _ in members]
+            starts = [offset for _, offset, _, _ in members]
+            sizes = [nbytes for _, _, nbytes, _ in members]
+            if UnitMeta.fits(states, starts, sizes):
+                self.metas[number] = UnitMeta(states, starts, states[0].absmax.device)
+        except Exception:  # noqa: BLE001 - one launch per weight instead
+            self.metas.pop(number, None)
 
     def _register(self, unit):
         number = len(self.units)
@@ -131,7 +151,7 @@ class WeightStreamer:
             self.stream.wait_event(queued)
             gpu.copy_(unit.region, non_blocking=True)
             done.record(self.stream)
-        self.ready[number] = [gpu, done, False, len(unit.members)]
+        self.ready[number] = [gpu, done, False, len(unit.members), None]
 
     def prefetch_backward(self):
         """Before the backward pass: its first weights are the last layer's."""
@@ -152,14 +172,51 @@ class WeightStreamer:
         for ahead in range(1, AHEAD + 1):
             self._fetch(number + step * ahead)
         entry = self.ready[number]
-        if not entry[2]:
-            compute = self.compute if self.compute is not None else torch.cuda.current_stream()
-            compute.wait_event(entry[1])
-            entry[2] = True
+        if entry[0] is None:  # already dequantized for this pass by weight(): fetch it again
+            del self.ready[number]
+            self._fetch(number)
+            entry = self.ready[number]
+        self._wait(entry)
         entry[3] -= 1
         if entry[3] <= 0:  # every weight of the unit taken: its buffer goes with the last view
             del self.ready[number]
         return entry[0][offset:offset + nbytes].view(shape)
+
+    def _wait(self, entry):
+        if not entry[2]:
+            compute = self.compute if self.compute is not None else torch.cuda.current_stream()
+            compute.wait_event(entry[1])
+            entry[2] = True
+
+    def weight(self, packed, quant_state, dtype=torch.float16):
+        """The fp16 weight of a packed 4-bit weight. A streamed layer is dequantized whole, in
+        one launch, at its first weight of the pass; its other weights are views of that."""
+        from .nf4 import dequantize_nf4, dequantize_unit
+
+        position = None if packed.is_cuda or dtype != torch.float16 \
+            else self.index.get(packed.data_ptr())
+        if position is None:
+            return dequantize_nf4(self.get(packed), quant_state, dtype)
+        self._ensure_units()
+        number, offset, _, _ = self.unit_of[position]
+        meta = self.metas.get(number)
+        if meta is None:
+            return dequantize_nf4(self.get(packed), quant_state, dtype)
+        step = 1 if torch._C._current_graph_task_id() == -1 else -1  # forward or backward
+        self._fetch(number)
+        for ahead in range(1, AHEAD + 1):
+            self._fetch(number + step * ahead)
+        entry = self.ready[number]
+        if entry[4] is None:
+            self._wait(entry)
+            entry[4] = dequantize_unit(entry[0], meta)
+            entry[0] = None  # the packed copy is not needed any more
+        weights = entry[4]
+        entry[3] -= 1
+        if entry[3] <= 0:
+            del self.ready[number]
+        count = quant_state.shape[0] * quant_state.shape[1]
+        return weights[2 * offset:2 * offset + count].view(tuple(quant_state.shape))
 
 
 STREAMER = WeightStreamer()

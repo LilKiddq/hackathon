@@ -31,7 +31,7 @@ def _fp16_4bit(module):
 def _weight(module):
     """The fp16 weight of a 4-bit projection (streamed in from the host by wstream.py)."""
     weight = module.weight
-    return dequantize_nf4(STREAMER.get(weight), weight.quant_state, torch.float16)
+    return STREAMER.weight(weight, weight.quant_state, torch.float16)
 
 
 class FusedMLP(torch.autograd.Function):

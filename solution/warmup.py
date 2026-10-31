@@ -72,6 +72,18 @@ def _compile_all():
                                   offset=torch.zeros((), device=device))
     dequantize_nf4(torch.zeros(1024, device=device, dtype=torch.uint8), state)
 
+    from .nf4 import UnitMeta, dequantize_unit  # a whole layer in one launch (wstream.py)
+
+    def fake_state(rows):
+        inner = types.SimpleNamespace(code=torch.linspace(-1, 1, 256, device=device),
+                                      absmax=torch.ones(1, device=device), blocksize=256)
+        return types.SimpleNamespace(shape=(rows, 64), blocksize=64, state2=inner,
+                                     absmax=torch.zeros(rows, device=device, dtype=torch.uint8),
+                                     offset=torch.zeros((), device=device))
+
+    dequantize_unit(torch.zeros(2048, device=device, dtype=torch.uint8),
+                    UnitMeta([fake_state(32), fake_state(32)], [0, 1024], device))
+
     gate = randn(2, 8960, dtype=torch.float16).requires_grad_()
     up = randn(2, 8960, dtype=torch.float16).requires_grad_()
     swiglu(gate, up).sum().backward()

@@ -65,6 +65,108 @@ def nf4_dequant_kernel(packed_ptr, absmax8_ptr, code2_ptr, absmax2_ptr, offset_p
         tl.store(out_ptr + out_idx, weights, mask=out_idx < n_out)
 
 
+@triton.jit
+def nf4_unit_dequant_kernel(packed_ptr, member_ptr, start_ptr, a8_base_ptr, a2_base_ptr,
+                            offset_ptr, absmax8_ptr, code2_ptr, absmax2_ptr, table_ptr, out_ptr,
+                            n_bytes, HALF_BLOCK: tl.constexpr, GROUP2: tl.constexpr,
+                            BLOCK_BYTES: tl.constexpr, EXACT: tl.constexpr):
+    """nf4_dequant_kernel for all the weights of a decoder layer in one launch: their packed
+    bytes sit back to back in one buffer (wstream.py), each program stays inside one weight
+    (its sizes are multiples of BLOCK_BYTES) and reads that weight's scales from the layer's
+    concatenated absmax tables. Output: fp16 at twice the byte offset, as int32 words."""
+    pid = tl.program_id(0)
+    member = tl.load(member_ptr + pid)
+    byte_idx = pid.to(tl.int64) * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
+    valid = byte_idx < n_bytes
+    local = byte_idx - tl.load(start_ptr + member)
+    packed = tl.load(packed_ptr + byte_idx, mask=valid, other=0).to(tl.int32)
+    block = local // HALF_BLOCK
+    absmax8 = tl.load(absmax8_ptr + tl.load(a8_base_ptr + member) + block, mask=valid,
+                      other=0).to(tl.int32)
+    code2 = tl.load(code2_ptr + absmax8, mask=valid, other=0.0)
+    absmax2 = tl.load(absmax2_ptr + tl.load(a2_base_ptr + member) + block // GROUP2, mask=valid,
+                      other=0.0)
+    if EXACT:
+        scale = tl.inline_asm_elementwise("mul.rn.f32 $0, $1, $2;", "=r,r,r", [code2, absmax2],
+                                          dtype=tl.float32, is_pure=True, pack=1)
+    else:
+        scale = code2 * absmax2
+    scale = scale + tl.load(offset_ptr + member)
+    high = tl.load(table_ptr + (packed >> 4), mask=valid, other=0.0) * scale
+    low = tl.load(table_ptr + (packed & 15), mask=valid, other=0.0) * scale
+    high_bits = high.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+    low_bits = low.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+    tl.store(out_ptr + byte_idx, high_bits | (low_bits << 16), mask=valid)
+
+
+UNIT_BLOCK_BYTES = 512
+
+
+class UnitMeta:
+    """What nf4_unit_dequant_kernel needs for one layer's weights (built once, on the GPU)."""
+
+    def __init__(self, states, starts, device):
+        first = states[0]
+        self.half_block = first.blocksize // 2
+        self.group2 = first.state2.blocksize
+        self.code2 = first.state2.code
+        nbytes = [state.shape[0] * state.shape[1] // 2 for state in states]
+        self.n_bytes = starts[-1] + nbytes[-1]
+        members = []
+        for number, (start, size) in enumerate(zip(starts, nbytes)):
+            members += [number] * (size // UNIT_BLOCK_BYTES)
+        self.member = torch.tensor(members, dtype=torch.int32, device=device)
+        self.start = torch.tensor(starts, dtype=torch.int64, device=device)
+        a8 = [state.absmax.numel() for state in states]
+        a2 = [state.state2.absmax.numel() for state in states]
+        self.a8_base = torch.tensor([sum(a8[:i]) for i in range(len(a8))], dtype=torch.int64,
+                                    device=device)
+        self.a2_base = torch.tensor([sum(a2[:i]) for i in range(len(a2))], dtype=torch.int64,
+                                    device=device)
+        offsets = [state.offset if torch.is_tensor(state.offset)
+                   else torch.tensor(float(state.offset)) for state in states]
+        self.offsets = torch.stack([o.float().reshape(()).to(device) for o in offsets])
+        # the layer's absmax tables, concatenated; each weight's quant state now views its part
+        self.absmax8 = torch.cat([state.absmax.reshape(-1) for state in states])
+        self.absmax2 = torch.cat([state.state2.absmax.reshape(-1).float() for state in states])
+        for i, state in enumerate(states):
+            state.absmax = self.absmax8[int(self.a8_base[i]):int(self.a8_base[i]) + a8[i]] \
+                .view(state.absmax.shape)
+            state.state2.absmax = \
+                self.absmax2[int(self.a2_base[i]):int(self.a2_base[i]) + a2[i]] \
+                .view(state.state2.absmax.shape)
+
+    @staticmethod
+    def fits(states, starts, sizes):
+        """One launch works when the weights are NF4 with the same block sizes and code, each a
+        multiple of the program size, back to back (no gaps between them)."""
+        if len(states) < 2 or not all(supported(state) for state in states):
+            return False
+        first = states[0]
+        for state, start, size in zip(states, starts, sizes):
+            if (state.blocksize != first.blocksize
+                    or state.state2.blocksize != first.state2.blocksize
+                    or state.shape[1] % 2 or size % UNIT_BLOCK_BYTES
+                    or size != state.shape[0] * state.shape[1] // 2
+                    or state.state2.code.shape != first.state2.code.shape
+                    or not torch.equal(state.state2.code, first.state2.code)):
+                return False
+        return all(starts[i] + sizes[i] == starts[i + 1] for i in range(len(starts) - 1))
+
+
+def dequantize_unit(packed, meta):
+    """fp16 weights of a whole layer from its packed bytes (one GPU buffer) in one launch: the
+    weight at byte offset o with n elements is out[2 * o: 2 * o + n]."""
+    out = torch.empty(2 * meta.n_bytes, dtype=torch.float16, device=packed.device)
+    programs = meta.member.numel()
+    nf4_unit_dequant_kernel[(programs,)](
+        packed.reshape(-1), meta.member, meta.start, meta.a8_base, meta.a2_base, meta.offsets,
+        meta.absmax8, meta.code2, meta.absmax2, _table(packed.device), out.view(torch.int32),
+        meta.n_bytes, HALF_BLOCK=meta.half_block, GROUP2=meta.group2,
+        BLOCK_BYTES=UNIT_BLOCK_BYTES, EXACT=packed.is_cuda, num_warps=4, enable_fp_fusion=False)
+    return out
+
+
 _tables = {}
 
 
@@ -111,7 +213,7 @@ class NF4Linear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, packed, quant_state, bias=None):
-        weight = dequantize_nf4(STREAMER.get(packed), quant_state, x.dtype)
+        weight = STREAMER.weight(packed, quant_state, x.dtype)
         ctx.quant_state = quant_state
         ctx.save_for_backward(packed)
         return torch.nn.functional.linear(x, weight, bias)
@@ -119,7 +221,7 @@ class NF4Linear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         (packed,) = ctx.saved_tensors
-        weight = dequantize_nf4(STREAMER.get(packed), ctx.quant_state, grad.dtype)
+        weight = STREAMER.weight(packed, ctx.quant_state, grad.dtype)
         return grad @ weight, None, None, None
 
 
