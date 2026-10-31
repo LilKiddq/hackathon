@@ -494,6 +494,29 @@ def test_int8_table_in_host_memory_gives_the_same_results():
                                Int8Embedding.apply(ids, q, scale), rtol=0, atol=0)
 
 
+def test_row_attention_recomputed_in_backward_matches():
+    """unpad.RowsAttention keeps only q and the grouped k/v and recomputes the attention in the
+    backward pass: the same output and the same gradients as differentiating it directly."""
+    from solution.unpad import RowsAttention, _attend
+
+    torch.manual_seed(6)
+    rows = (37, 0, 300, 5, 128)
+    n = sum(rows)
+    q = torch.randn(1, 12, n, 128, device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.randn(1, 2, n, 128, device="cuda", dtype=torch.float16, requires_grad=True)
+    v = torch.randn(1, 2, n, 128, device="cuda", dtype=torch.float16, requires_grad=True)
+    grad = torch.randn(1, n, 12 * 128, device="cuda", dtype=torch.float16)
+    ref = _attend(q, k, v, rows, 6, 0.0884)
+    ref.backward(grad)
+    ref_grads = (q.grad, k.grad, v.grad)
+    q.grad = k.grad = v.grad = None
+    out = RowsAttention.apply(q, k, v, rows, 6, 0.0884)
+    out.backward(grad)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    for actual, expected in zip((q.grad, k.grad, v.grad), ref_grads):
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
+
 def test_warmup_leaves_the_global_rng_alone():
     from solution import warmup
 
