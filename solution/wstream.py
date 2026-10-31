@@ -50,6 +50,7 @@ class WeightStreamer:
                     host.copy_(weight.data)
                     weight.data = host
                 host = weight.data  # already on the host when loading put it there
+                HOSTED.add(host.data_ptr())
                 self.index[host.data_ptr()] = len(self.host)
                 self.host.append(host)
         if self.host:
@@ -161,6 +162,40 @@ def reserve_weight_block(config):
 
 EMBEDDING_ON_HOST = [False]  # set when loading put the tied embedding in host memory
 LOADED_TO_HOST = [0]  # 4-bit weights loading put in host memory
+HOSTED = set()  # data pointers of the 4-bit weights that live in host memory
+
+
+def keep_hosted_weights_on_host():
+    """`Params4bit.to(cuda)` on a weight that lives in our host memory leaves it there.
+
+    At the start of training accelerate's `prepare_model` calls `model.to(device)`; on the base
+    run that is a no-op, but here it would copy all 196 packed weights (624 MiB) back to the GPU
+    (the run's memory peak) only for the first training step to move them out again. The weights
+    reach the GPU through wstream's window instead, so the move is skipped for them; any other
+    tensor moves as usual."""
+    try:
+        import bitsandbytes
+
+        cls = bitsandbytes.nn.Params4bit
+    except Exception:  # noqa: BLE001
+        return
+    original = cls.to
+    if getattr(original, "_kc_patched", False):
+        return
+
+    def to(self, *args, **kwargs):
+        data = self.data
+        if HOSTED and not data.is_cuda and data.data_ptr() in HOSTED:
+            try:
+                device, dtype, _, _ = torch._C._nn._parse_to(*args, **kwargs)
+            except Exception:  # noqa: BLE001 - not a device move we understand
+                device, dtype = None, None
+            if device is not None and device.type == "cuda" and dtype in (None, self.dtype):
+                return self
+        return original(self, *args, **kwargs)
+
+    to._kc_patched = True
+    cls.to = to
 
 
 def _is_gpu(device):
@@ -197,6 +232,7 @@ def weights_to_host_while_loading():
       allocations faster. Here those weights do not stay on the GPU, so the block would only be
       the run's memory peak (~1.07 GB). Loading itself is unchanged."""
     hosted = []
+    keep_hosted_weights_on_host()
     with contextlib.ExitStack() as stack:
         try:
             import bitsandbytes
@@ -212,6 +248,7 @@ def weights_to_host_while_loading():
                         host.copy_(data)
                         result.data = host
                         hosted.append(host.data_ptr())
+                        HOSTED.add(host.data_ptr())
                     return result
                 return _quantize
 
