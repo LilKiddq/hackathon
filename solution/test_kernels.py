@@ -267,7 +267,7 @@ def test_offloaded_swiglu_matches_and_frees_gpu_memory():
         before = torch.cuda.memory_allocated()
         x, out = run(OffloadedSwiGLU.apply)
         torch.cuda.synchronize()
-        OFFLOADER._retire()
+        torch.empty(1, device="cuda")  # the allocator frees the copied tensors on its next call
         assert all(entry.host is not None and entry.gpu is None for entry in OFFLOADER.entries)
         kept = torch.cuda.memory_allocated() - before
         pairs = layers * 2 * tokens * inter * 2  # every layer's gate and up, fp16
@@ -370,6 +370,8 @@ def test_saved_tensor_offload_matches_and_frees_gpu_memory():
             before = torch.cuda.memory_allocated()
             x, out = run(True)
             OFFLOADER.release_all()
+            torch.cuda.synchronize()
+            torch.empty(1, device="cuda")  # the allocator frees the copied tensors on its next call
             assert OFFLOADER.entries and all(e.host is not None for e in OFFLOADER.entries)
             assert torch.cuda.memory_allocated() - before < kept_plain * 0.75
             OFFLOADER.prefetch_last()

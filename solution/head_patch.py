@@ -320,7 +320,9 @@ def _start_pinning(cfg=None, tcfg=None, *_):
         max_tokens = int(tcfg.batch_size) * int(cfg.data.max_length)
         nbytes = offload.arena_bytes(config, max_tokens)
         if isinstance(nbytes, int) and nbytes > 0:
-            offload.OFFLOADER.reserve_in_background(nbytes)
+            from .wstream import reserve_weight_block
+
+            offload.OFFLOADER.reserve_in_background(nbytes, first=reserve_weight_block(config))
     except Exception:  # noqa: BLE001 - only a head start; training never depends on it
         return
 

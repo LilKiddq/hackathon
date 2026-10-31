@@ -22,7 +22,6 @@ TIMEOUT_S = 120  # the warm-up takes ~10 s; past this the kernels just compile o
 
 def _compile_all():
     from .add_rmsnorm import AddRMSNorm
-    from .fused_ce import fused_lm_head_ce
     from .nf4 import dequantize_nf4
     from .rmsnorm import rms_norm
     from .rope import RoPE
@@ -54,14 +53,9 @@ def _compile_all():
     # dense gradients: .sum() would hand back stride-0 ones, another specialization
     torch.autograd.backward((q_out, k_out), (torch.ones_like(q_out), torch.ones_like(k_out)))
 
-    rows, width, vocab = 8, 64, 4096  # the vocabulary only has to share 151936's divisibility
-    head_in = randn(rows, width).requires_grad_()
-    head = randn(vocab, width, dtype=torch.float16)
-    target = torch.randint(0, vocab, (rows,), device=device, generator=gen)
-    target[::2] = -100
-    loss = fused_lm_head_ce(head_in, head, target, (target != -100).sum().float())[0]
-    loss.backward()
-
+    # the head (head8.py, int8 weight); fused_ce.py's fp16 head is only the fallback when the
+    # weight cannot be held as int8, and compiles on first use then
+    rows, width = 8, 64
     from .head8 import TILE_V, Int8Embedding, fused_int8_head_ce, quantize_rows
 
     q8, s8 = quantize_rows(randn(2 * TILE_V + 4480, width, dtype=torch.float16))  # as 151936

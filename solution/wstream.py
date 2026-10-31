@@ -11,6 +11,7 @@ The dequantization reads exactly the same bytes, so the numbers do not change.
 """
 
 import contextlib
+import threading
 
 import torch
 
@@ -100,6 +101,51 @@ class WeightStreamer:
 STREAMER = WeightStreamer()
 
 
+class _HostBlock:
+    """One pinned block for all packed weights, pinned in the background before the model loads
+    (one pinning call instead of one per weight while loading); weights take slices of it."""
+
+    def __init__(self):
+        self.block, self.cursor, self.ready = None, 0, threading.Event()
+
+    def reserve(self, nbytes):
+        try:
+            self.block = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        except Exception:  # noqa: BLE001 - without it each weight is pinned on its own
+            self.block = None
+        finally:
+            self.ready.set()
+
+    def take(self, nbytes):
+        if not self.ready.is_set() and not self.ready.wait(30):
+            return None
+        start = -(-self.cursor // 512) * 512
+        if self.block is None or start + nbytes > self.block.numel():
+            return None
+        self.cursor = start + nbytes
+        return self.block[start:start + nbytes]
+
+
+HOST_BLOCK = None
+
+
+def reserve_weight_block(config):
+    """Start-of-setup: the packed weights' total size from the checkpoint's config.json (all
+    projections are NF4, two weights per byte), reserved by the offload pinning thread."""
+    global HOST_BLOCK
+    layers = getattr(config, "num_hidden_layers", 0) or 0
+    hidden = getattr(config, "hidden_size", 0) or 0
+    inter = getattr(config, "intermediate_size", 0) or 0
+    heads = getattr(config, "num_attention_heads", 0) or 0
+    kv = getattr(config, "num_key_value_heads", heads) or heads
+    if not (layers and hidden and inter and heads):
+        return None
+    head_dim = getattr(config, "head_dim", None) or hidden // heads
+    per_layer = (2 * heads * head_dim * hidden + 2 * kv * head_dim * hidden + 3 * inter * hidden) // 2
+    HOST_BLOCK = _HostBlock()
+    return lambda: HOST_BLOCK.reserve(layers * (per_layer + 7 * 512))
+
+
 @contextlib.contextmanager
 def weights_to_host_while_loading():
     """While Soup loads the model: each 4-bit weight goes to pinned host memory as soon as
@@ -118,7 +164,9 @@ def weights_to_host_while_loading():
         result = original(self, device)
         data = result.data
         if data.is_cuda and data.dtype == torch.uint8:
-            host = torch.empty(data.shape, dtype=data.dtype, pin_memory=True)
+            host = HOST_BLOCK.take(data.numel()) if HOST_BLOCK is not None else None
+            host = host.view(data.shape) if host is not None else \
+                torch.empty(data.shape, dtype=data.dtype, pin_memory=True)
             host.copy_(data)
             result.data = host
             hosted.append(host.data_ptr())
