@@ -198,7 +198,28 @@ def _fp16_tied_embedding(model):
     embed.weight = half
     head.weight = half
     del weight
-    embed.register_forward_hook(lambda module, args, output: output.float())
+    _fp16_stream(lm)
+
+
+def _fp16_stream(lm):
+    """The residual stream in fp16 instead of fp32.
+
+    prepare_model_for_kbit_training upcasts the norm weights (and with them the embedding output,
+    the residual stream and every norm) to fp32. The task allows any numerics that keep the
+    adapter's quality (eval loss within +0.5 % of the base, loss curve, entropy, accuracy and
+    rewind within the checks' limits), and on a T4 fp16 is the compute dtype anyway: the norm
+    weights go back to fp16 (exact: bf16 in the checkpoint), so the embedding output, the residual
+    adds and the norms run in fp16. Our norm kernels still accumulate in fp32. LoRA weights and
+    the optimizer stay fp32. This drops every fp32<->fp16 cast around the 4-bit layers and halves
+    the norms' saved activations."""
+    from transformers.models.qwen2 import modeling_qwen2
+
+    for module in lm.modules():
+        if isinstance(module, modeling_qwen2.Qwen2RMSNorm):
+            weight = module.weight
+            if weight.dtype == torch.float32 and not weight.requires_grad:
+                module.weight = torch.nn.Parameter(weight.detach().to(torch.float16),
+                                                   requires_grad=False)
 
 
 def _start_pinning(cfg=None, tcfg=None, *_):

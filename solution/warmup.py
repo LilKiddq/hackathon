@@ -38,24 +38,25 @@ def _compile_all():
     def randn(*shape, dtype=torch.float32):
         return torch.randn(*shape, device=device, dtype=dtype, generator=gen)
 
-    x = randn(2, hidden).requires_grad_()
-    weight = torch.ones(hidden, device=device)
+    half = torch.float16  # the residual stream's dtype in training (head_patch._fp16_stream)
+    x = randn(2, hidden, dtype=half).requires_grad_()
+    weight = torch.ones(hidden, device=device, dtype=half)
     rms_norm(x, weight, 1e-6).sum().backward()
 
-    residual = randn(2, hidden).requires_grad_()
-    delta = randn(2, hidden, dtype=torch.float16).requires_grad_()
+    residual = randn(2, hidden, dtype=half).requires_grad_()
+    delta = randn(2, hidden, dtype=half).requires_grad_()
     s, y = AddRMSNorm.apply(residual, delta, weight, 1e-6)
     (s.sum() + y.sum()).backward()
 
-    q = randn(1, 5, 12, 128).transpose(1, 2).requires_grad_()
-    k = randn(1, 5, 2, 128).transpose(1, 2).requires_grad_()
-    cos, sin = randn(1, 5, 128), randn(1, 5, 128)
-    q_out, k_out = RoPE.apply(q, k, cos, sin, torch.float16)  # as under fp16 autocast
+    q = randn(1, 5, 12, 128, dtype=half).transpose(1, 2).requires_grad_()
+    k = randn(1, 5, 2, 128, dtype=half).transpose(1, 2).requires_grad_()
+    cos, sin = randn(1, 5, 128, dtype=half), randn(1, 5, 128, dtype=half)
+    q_out, k_out = RoPE.apply(q, k, cos, sin)
     # dense gradients: .sum() would hand back stride-0 ones, another specialization
     torch.autograd.backward((q_out, k_out), (torch.ones_like(q_out), torch.ones_like(k_out)))
 
     rows, width, vocab = 8, 64, 4096  # the vocabulary only has to share 151936's divisibility
-    head_in = randn(rows, width).requires_grad_()
+    head_in = randn(rows, width, dtype=half).requires_grad_()
     head = randn(vocab, width, dtype=torch.float16)
     target = torch.randint(0, vocab, (rows,), device=device, generator=gen)
     target[::2] = -100

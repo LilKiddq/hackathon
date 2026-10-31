@@ -34,7 +34,7 @@ def patch_qwen2_mlp_fp16():
 
     def forward(self, x):
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
-        if (act != "silu" or not x.is_cuda or x.dtype != torch.float32
+        if (act != "silu" or not x.is_cuda or x.dtype not in (torch.float32, torch.float16)
                 or not all(_fp16_4bit(m) for m in (self.gate_proj, self.up_proj, self.down_proj))):
             return original(self, x)
         gate = self.gate_proj(x.to(torch.float16))

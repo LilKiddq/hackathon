@@ -356,3 +356,41 @@ def test_unpad_never_reuses_an_earlier_batch():
     out.sum().backward()
     got = model(input_ids=ids, attention_mask=full, use_cache=False).last_hidden_state
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("shape", [(4, 512, 1536), (3, 77, 1000)])
+def test_fp16_stream_norms_match_pytorch(shape):
+    """The residual stream in fp16 (head_patch._fp16_stream): both norm kernels against Qwen2's
+    own fp16 ops, within fp16 rounding."""
+    from solution.add_rmsnorm import AddRMSNorm
+    from solution.rmsnorm import rms_norm
+
+    def qwen_norm(x, w):
+        h = x.float()
+        return w * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)).to(x.dtype)
+
+    torch.manual_seed(0)
+    w = (torch.rand(shape[-1], device="cuda") + 0.5).half()
+    r = (torch.randn(shape, device="cuda") * 4).half().requires_grad_()
+    d = torch.randn(shape, device="cuda").half().requires_grad_()
+    gs, gy = torch.randn(shape, device="cuda").half(), torch.randn(shape, device="cuda").half()
+    s = r + d
+    y = qwen_norm(s, w)
+    torch.autograd.backward((s.float(), y.float()), (gs.float(), gy.float()))
+    ref = (s.detach(), y.detach(), r.grad.clone(), d.grad.clone())
+    r.grad = d.grad = None
+    s2, y2 = AddRMSNorm.apply(r, d, w, 1e-6)
+    torch.autograd.backward((s2, y2), (gs, gy))
+    for got, want in zip((s2, y2, r.grad, d.grad), ref):
+        assert got.dtype == torch.float16
+        torch.testing.assert_close(got.float(), want.float(), rtol=4e-3, atol=4e-3)
+
+    x = (torch.randn(shape, device="cuda") * 3).half().requires_grad_()
+    g = torch.randn(shape, device="cuda").half()
+    want = qwen_norm(x, w)
+    want.float().backward(g.float())
+    want_dx, x.grad = x.grad.clone(), None
+    got = rms_norm(x, w, 1e-6)
+    got.backward(g)
+    torch.testing.assert_close(got.float(), want.float(), rtol=4e-3, atol=4e-3)
+    torch.testing.assert_close(x.grad.float(), want_dx.float(), rtol=4e-3, atol=4e-3)

@@ -20,11 +20,13 @@ def add_rmsnorm_fwd_kernel(r_ptr, d_ptr, w_ptr, s_ptr, y_ptr, inv_ptr,
     offset = row * n_cols + col
     r = tl.load(r_ptr + offset, valid, other=0).to(tl.float32)
     d = tl.load(d_ptr + offset, valid, other=0).to(tl.float32)
-    s = r + d
+    # rounded to the stream's dtype, as `residual + hidden_states` is (exact for fp32)
+    s = (r + d).to(s_ptr.dtype.element_ty).to(tl.float32)
     inv = tl.rsqrt(tl.sum(s * s, 0) / n_cols + eps)
     w = tl.load(w_ptr + col, valid, other=0).to(tl.float32)
-    tl.store(s_ptr + offset, s, valid)
-    tl.store(y_ptr + offset, w * (s * inv), valid)
+    normed = (s * inv).to(y_ptr.dtype.element_ty).to(tl.float32)  # Qwen2RMSNorm's .to(dtype)
+    tl.store(s_ptr + offset, s.to(s_ptr.dtype.element_ty), valid)
+    tl.store(y_ptr + offset, (w * normed).to(y_ptr.dtype.element_ty), valid)
     tl.store(inv_ptr + row, inv)
 
 
@@ -38,14 +40,14 @@ def add_rmsnorm_bwd_kernel(ds_ptr, dy_ptr, s_ptr, w_ptr, inv_ptr,
     offset = row * n_cols + col
     ds = tl.load(ds_ptr + offset, valid & has_ds, other=0).to(tl.float32)
     dy = tl.load(dy_ptr + offset, valid & has_dy, other=0).to(tl.float32)
-    s = tl.load(s_ptr + offset, valid, other=0)
-    w = tl.load(w_ptr + col, valid, other=0)
+    s = tl.load(s_ptr + offset, valid, other=0).to(tl.float32)
+    w = tl.load(w_ptr + col, valid, other=0).to(tl.float32)
     inv = tl.load(inv_ptr + row)
     n = s * inv
     g = dy * w
     total = ds + inv * (g - n * (tl.sum(g * n, 0) / n_cols))
-    tl.store(dr_ptr + offset, total, valid)
-    tl.store(dd_ptr + offset, total, valid)
+    tl.store(dr_ptr + offset, total.to(dr_ptr.dtype.element_ty), valid)
+    tl.store(dd_ptr + offset, total.to(dd_ptr.dtype.element_ty), valid)
 
 
 class AddRMSNorm(torch.autograd.Function):
@@ -88,9 +90,10 @@ class AddRMSNorm(torch.autograd.Function):
 
 def _can_fuse(residual, delta, weight):
     return (residual.is_cuda and delta.device == residual.device
-            and weight.device == residual.device and residual.dtype == torch.float32
+            and weight.device == residual.device
+            and residual.dtype in (torch.float32, torch.float16)
             and delta.dtype in (torch.float16, torch.float32)
-            and weight.dtype == torch.float32 and not weight.requires_grad
+            and weight.dtype == residual.dtype and not weight.requires_grad
             and residual.shape == delta.shape and residual.ndim > 0
             and residual.numel() > 0 and 0 < residual.shape[-1] <= 8192
             and weight.shape == (residual.shape[-1],) and weight.is_contiguous())
