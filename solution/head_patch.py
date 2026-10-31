@@ -181,6 +181,14 @@ def patch_sft_trainer():
     cls.compute_loss = compute_loss
 
 
+def _tied_embedding(lm):
+    embed, head = lm.get_input_embeddings(), lm.lm_head
+    weight = getattr(embed, "weight", None)
+    if weight is None or weight is not getattr(head, "weight", None) or not weight.is_cuda:
+        return None
+    return weight
+
+
 def _fp16_tied_embedding(model):
     """Keep the tied embedding / lm_head weight in fp16 instead of fp32.
 
@@ -189,20 +197,65 @@ def _fp16_tied_embedding(model):
     and every bf16 value in fp16's normal range is exact in fp16, so the fp16 tensor holds the
     same numbers (the head used fp16 under autocast anyway). The embedding output is widened back
     to fp32 by a forward hook, so the residual stream and everything after it see fp32 as before.
+    `patch_kbit_preparation` keeps the upcast from happening at all (its fp32 copy next to the
+    fp16 one was the run's memory peak during setup); this handles the weight either way.
     """
     lm = _causal_lm(model)
     if lm is None:
         return
-    embed, head = lm.get_input_embeddings(), lm.lm_head
-    weight = embed.weight
-    if (weight is not head.weight or weight.dtype != torch.float32 or not weight.is_cuda
-            or weight.requires_grad):
+    weight = _tied_embedding(lm)
+    if weight is None or weight.requires_grad or getattr(weight, "_kc_fp16", False) is None:
         return
-    half = torch.nn.Parameter(weight.detach().to(torch.float16), requires_grad=False)
-    embed.weight = half
-    head.weight = half
-    del weight
-    embed.register_forward_hook(lambda module, args, output: output.float())
+    if weight.dtype == torch.float32:
+        half = torch.nn.Parameter(weight.detach().to(torch.float16), requires_grad=False)
+        lm.get_input_embeddings().weight = half
+        lm.lm_head.weight = half
+        del weight
+    elif not getattr(weight, "_kc_fp16", False):
+        return
+    else:
+        weight._kc_fp16 = None  # hooked once
+    lm.get_input_embeddings().register_forward_hook(lambda module, args, output: output.float())
+
+
+def patch_kbit_preparation():
+    """peft's prepare_model_for_kbit_training without the fp32 copy of the tied embedding.
+
+    It casts every fp16/bf16 parameter to fp32; for the 151936 x 1536 tied embedding that is a
+    933 MB tensor allocated next to the 467 MB one it replaces, which `_fp16_tied_embedding`
+    then turns back into fp16. Here the embedding sits out the cast (an empty stand-in takes its
+    place for the call) and comes back as fp16 holding the same values (bf16 -> fp16 is exact in
+    fp16's range; fp16 stays fp16), frozen like every base parameter. Soup imports the function
+    from peft at call time."""
+    import peft
+
+    original = peft.prepare_model_for_kbit_training
+    if getattr(original, "_kc_patched", False):
+        return
+
+    def prepare_model_for_kbit_training(model, *args, **kwargs):
+        lm = model if hasattr(model, "lm_head") and hasattr(model, "get_input_embeddings") \
+            else None
+        weight = None
+        if lm is not None:
+            try:
+                weight = _tied_embedding(lm)
+            except Exception:  # noqa: BLE001 - anything unusual: peft's own path
+                weight = None
+        if weight is None or weight.dtype not in (torch.float16, torch.bfloat16):
+            return original(model, *args, **kwargs)
+        data = weight.data
+        weight.data = data.new_empty(0)
+        try:
+            result = original(model, *args, **kwargs)
+        finally:
+            weight.data = data if data.dtype == torch.float16 else data.to(torch.float16)
+        weight.requires_grad_(False)
+        weight._kc_fp16 = True
+        return result
+
+    prepare_model_for_kbit_training._kc_patched = True
+    peft.prepare_model_for_kbit_training = prepare_model_for_kbit_training
 
 
 def _start_pinning(cfg=None, tcfg=None, *_):
@@ -244,6 +297,10 @@ def patch_soup_setup():
 
     def _setup_transformers(self, *args, **kwargs):
         _start_pinning(*args)
+        try:
+            patch_kbit_preparation()  # peft is imported here anyway, right before it is used
+        except Exception:  # noqa: BLE001 - without it the upcast happens and is undone below
+            pass
         result = original(self, *args, **kwargs)
         model = getattr(self, "model", None)
         if isinstance(model, torch.nn.Module):

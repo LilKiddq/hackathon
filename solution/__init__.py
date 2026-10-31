@@ -38,6 +38,6 @@ def apply():
     patch_qwen2_rope()  # ours: fused rotary embedding for q and k, forward + backward
     patch_causal_lm()  # ours: lm_head + cross-entropy + entropy/accuracy without full logits
     patch_sft_trainer()  # logs TRL's metrics and Soup's rewind losses from the fused step
-    patch_soup_setup()  # tied embedding / lm_head kept in fp16 (same values), -933 MB
+    patch_soup_setup()  # tied embedding / lm_head kept in fp16, never upcast to fp32 (-933 MB)
     patch_bnb_matmul_4bit()  # ours: one-launch NF4 dequantization for every 4-bit layer
     start_kernel_warmup()  # compile the kernels in the background while Soup loads the model
