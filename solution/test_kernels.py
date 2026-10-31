@@ -381,6 +381,50 @@ def test_saved_tensor_offload_matches_and_frees_gpu_memory():
         OFFLOADER.armed = False
 
 
+def test_streamed_nf4_weights_give_the_same_results():
+    """A chain of NF4 layers with their packed weights in host memory (wstream.py): the same
+    outputs and gradients bit for bit as with the weights on the GPU, over several steps."""
+    import bitsandbytes.functional as F
+    from solution.nf4 import NF4Linear
+    from solution.wstream import WeightStreamer
+    import solution.nf4 as nf4
+
+    torch.manual_seed(3)
+    layers = [F.quantize_4bit((torch.randn(256, 256, device="cuda") * 0.05).half(),
+                              blocksize=64, quant_type="nf4", compress_statistics=True)
+              for _ in range(12)]
+    x0 = torch.randn(64, 256, device="cuda", dtype=torch.float16)
+    grad = torch.randn(64, 256, device="cuda", dtype=torch.float16)
+
+    def run(weights):
+        x = x0.clone().requires_grad_()
+        h = x
+        for packed, (_, state) in zip(weights, layers):
+            h = torch.tanh(NF4Linear.apply(h, packed, state))
+        h.backward(grad)
+        return h.detach(), x.grad
+
+    ref = run([packed for packed, _ in layers])
+    streamer = WeightStreamer()
+    hosts = []
+    for packed, _ in layers:
+        host = torch.empty(packed.shape, dtype=packed.dtype, pin_memory=True)
+        host.copy_(packed)
+        streamer.index[host.data_ptr()] = len(streamer.host)
+        streamer.host.append(host)
+        hosts.append(host)
+    streamer.stream = torch.cuda.Stream()
+    saved, nf4.STREAMER = nf4.STREAMER, streamer
+    try:
+        for _ in range(3):
+            streamer.new_step()
+            out = run(hosts)
+            torch.testing.assert_close(out[0], ref[0], rtol=0, atol=0)
+            torch.testing.assert_close(out[1], ref[1], rtol=0, atol=0)
+    finally:
+        nf4.STREAMER = saved
+
+
 def test_warmup_leaves_the_global_rng_alone():
     from solution import warmup
 

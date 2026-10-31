@@ -20,6 +20,7 @@ import torch
 from torch.nn import functional
 
 from . import offload, warmup
+from .wstream import STREAMER
 from .fused_ce import IGNORE_INDEX, fused_lm_head_ce
 
 STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR, read by rewind
@@ -71,6 +72,7 @@ def _fused_forward(self, original, input_ids=None, attention_mask=None, position
         hidden.reshape(-1, width).index_select(0, rows), _fp16_weight(self.lm_head),
         flat_target.index_select(0, rows), denominator.float())
     offload.OFFLOADER.prefetch_last()  # and the last one comes back while the backward starts
+    STREAMER.prefetch_backward()  # as do the last layer's weights
 
     def scatter(values, dtype):
         full = torch.zeros(batch * seq, device=hidden.device, dtype=dtype)
@@ -146,6 +148,8 @@ def patch_sft_trainer():
         max_tokens = (getattr(self.args, "per_device_train_batch_size", 0) or 0) * \
             (getattr(self.args, "max_length", 0) or 0) or inputs["input_ids"].numel()
         offload.OFFLOADER.new_step(offload.arena_bytes(lm.config, max_tokens))
+        STREAMER.install(lm)  # once: the 4-bit weights move to host memory (wstream.py)
+        STREAMER.new_step()
         mode = "train"
         inputs.pop("_prediction_loss_only", None)  # as TRL does before it delegates
         inputs["use_cache"] = False

@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .wstream import STREAMER
+
 BLOCK_BYTES = 1024  # packed bytes per program -> 2048 weights
 
 NF4_TABLE = (
@@ -109,7 +111,7 @@ class NF4Linear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, packed, quant_state, bias=None):
-        weight = dequantize_nf4(packed, quant_state, x.dtype)
+        weight = dequantize_nf4(STREAMER.get(packed), quant_state, x.dtype)
         ctx.quant_state = quant_state
         ctx.save_for_backward(packed)
         return torch.nn.functional.linear(x, weight, bias)
@@ -117,7 +119,7 @@ class NF4Linear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         (packed,) = ctx.saved_tensors
-        weight = dequantize_nf4(packed, ctx.quant_state, grad.dtype)
+        weight = dequantize_nf4(STREAMER.get(packed), ctx.quant_state, grad.dtype)
         return grad @ weight, None, None, None
 
 
@@ -138,6 +140,8 @@ def patch_bnb_matmul_4bit():
                 and torch.is_grad_enabled() and A.requires_grad and A.numel() > 0
                 and supported(quant_state) and A.shape[-1] == quant_state.shape[1]):
             return NF4Linear.apply(A, B, quant_state, bias)
+        if A.is_cuda and not B.is_cuda:  # a weight streamed from the host (wstream.py)
+            B = STREAMER.get(B)
         return original(A, B, quant_state, out=out, bias=bias)
 
     matmul_4bit._kc_patched = True
