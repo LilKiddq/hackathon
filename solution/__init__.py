@@ -17,6 +17,7 @@ from .add_rmsnorm import patch_qwen2_add_rmsnorm
 from .head_patch import patch_causal_lm, patch_sft_trainer, patch_soup_setup
 from .mlp import patch_qwen2_mlp_fp16
 from .nf4 import patch_bnb_matmul_4bit
+from .offload import patch_qwen2_layer_offload
 from .rmsnorm import patch_qwen2_rmsnorm
 from .rope import patch_qwen2_rope
 from .startup import patch_soup_row_mapping, reuse_package_index
@@ -33,6 +34,7 @@ def apply():
     patch_qwen2_rmsnorm()  # ours: fused RMSNorm forward + backward
     patch_qwen2_add_rmsnorm()  # ours: residual add + post-attention RMSNorm in one kernel
     patch_qwen2_unpad()  # decoder layers on real tokens only (after add_rmsnorm: wraps its layer)
+    patch_qwen2_layer_offload()  # every layer's saved tensors to host memory (after unpad)
     patch_qwen2_rope()  # ours: fused rotary embedding for q and k, forward + backward
     patch_causal_lm()  # ours: lm_head + cross-entropy + entropy/accuracy without full logits
     patch_sft_trainer()  # logs TRL's metrics and Soup's rewind losses from the fused step

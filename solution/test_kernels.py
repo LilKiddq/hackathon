@@ -323,6 +323,60 @@ def test_offloaded_swiglu_without_synchronization():
         OFFLOADER.armed = False
 
 
+def test_saved_tensor_offload_matches_and_frees_gpu_memory():
+    """Layers whose saved tensors (attention on transposed views, fp32 norms, matmul inputs) go
+    through the offloader's saved-tensor hooks: same outputs and gradients bit for bit, and the
+    saved tensors leave the GPU."""
+    from solution.offload import OFFLOADER
+
+    torch.manual_seed(2)
+    layers, tokens, width, heads = 6, 300, 512, 8
+    weights = [(torch.randn(width, 3 * width, device="cuda") * 0.03).half() for _ in range(layers)]
+    x0 = torch.randn(tokens, width, device="cuda")
+    grad_out = torch.randn(tokens, width, device="cuda")
+
+    def layer(h, w):
+        n = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)  # fp32, saved
+        q, k, v = (n.half() @ w).view(1, tokens, 3, heads, -1).unbind(2)
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))  # dense non-contiguous views
+        a = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return h + a.transpose(1, 2).reshape(tokens, width).float()
+
+    def run(hooked):
+        x = x0.clone().requires_grad_()
+        h = x
+        for index, w in enumerate(weights):
+            if hooked:
+                OFFLOADER.layer = index
+                with torch.autograd.graph.saved_tensors_hooks(OFFLOADER.pack, OFFLOADER.unpack):
+                    h = layer(h, w)
+                OFFLOADER.layer = None
+            else:
+                h = layer(h, w)
+        return x, h
+
+    x, ref = run(False)
+    ref.backward(grad_out)
+    ref_grad = x.grad
+    del x
+    try:
+        for _ in range(2):
+            OFFLOADER.new_step(64 << 20)
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            x, out = run(True)
+            OFFLOADER.release_all()
+            assert OFFLOADER.entries and all(e.host is not None for e in OFFLOADER.entries)
+            assert torch.cuda.memory_allocated() - before < 8 * tokens * width * 4
+            OFFLOADER.prefetch_last()
+            out.backward(grad_out)
+            torch.testing.assert_close(out, ref, rtol=0, atol=0)
+            torch.testing.assert_close(x.grad, ref_grad, rtol=0, atol=0)
+            del x, out
+    finally:
+        OFFLOADER.armed = False
+
+
 def test_warmup_leaves_the_global_rng_alone():
     from solution import warmup
 

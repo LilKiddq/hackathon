@@ -6,9 +6,14 @@ half of the activation memory at the peak. SwiGLU's backward needs both.
 
 Here, right after SwiGLU's forward, they are copied to pinned host memory on a second CUDA
 stream while the GPU goes on with the next layers, and the GPU copies are released once the
-transfer is done (at most MAX_IN_FLIGHT layers wait for their transfer). In the backward pass each
+transfer is done (at most MAX_IN_FLIGHT_BYTES wait for their transfer). In the backward pass each
 layer's pair is copied back while the layer after it is still in its backward pass, so the
-transfer again overlaps compute. The copies are exact, so the numbers do not change. The task
+transfer again overlaps compute.
+
+`patch_qwen2_layer_offload` does the same for everything else a decoder layer saves for its
+backward pass (norm inputs, LoRA inputs and dropout masks, q/k/v and the attention output),
+through autograd's saved-tensor hooks (the mechanism of torch.autograd.graph.save_on_cpu, with
+our own arena, streams and per-layer prefetch). The copies are exact, so the numbers do not change. The task
 allows recomputation or offloading in our own code; its time is part of the measured run.
 
 SwiGLU itself is still the example's kernel (it does not count as ours); only what is kept for
@@ -17,18 +22,35 @@ its backward pass, and where, is ours.
 
 import atexit
 import threading
+import weakref
 
 import torch
 import triton
 
 from .swiglu import BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 
-MAX_IN_FLIGHT = 3  # forward transfers the CPU lets run ahead before it waits for the oldest
+MAX_IN_FLIGHT_BYTES = 256 << 20  # transfers the CPU lets run ahead before it waits for the oldest
+SAVED_MIN_BYTES = 256 << 10  # smaller saved tensors stay on the GPU (not worth a transfer)
+SAVED_PER_HIDDEN = 24  # arena estimate: bytes per token and hidden unit a layer saves
 ALIGN = 512
 
 
 class _Entry:
-    __slots__ = ("index", "device", "shape", "dtype", "gpu", "host", "copied", "back", "fetched")
+    __slots__ = ("index", "group", "device", "specs", "gpu", "host", "copied", "back", "fetched",
+                 "nbytes")
+
+
+def _dense(t):
+    """Non-overlapping and dense: the elements fill exactly numel slots of the storage, so a
+    host tensor with the same strides is a plain byte copy (a transposed view qualifies)."""
+    if t.is_contiguous():
+        return True
+    expected = 1
+    for stride, size in sorted((s, n) for s, n in zip(t.stride(), t.shape) if n != 1):
+        if stride != expected:
+            return False
+        expected *= size
+    return True
 
 
 class Offloader:
@@ -37,9 +59,15 @@ class Offloader:
         self.arena = None  # pinned uint8 host buffer, reused every step
         self.cursor = 0
         self.entries = []  # this step's entries, in forward order
+        self.groups = {}  # group (decoder layer, or entry index outside layers) -> its entries
         self.in_flight = []  # entries whose GPU tensors are kept until their transfer is done
+        self.in_flight_bytes = 0
         self.armed = False
+        self.layer = None  # the decoder layer whose forward is running (layer_offload)
+        self.seen = {}  # this step's packed tensors, so a tensor saved twice is copied once
         self._reserving = None
+        self.peak_cursor = 0
+        self.kept_on_gpu = 0
 
     def reserve(self, nbytes):
         """Pinned host memory for one step."""
@@ -48,7 +76,7 @@ class Offloader:
             self.arena = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
 
     def reserve_in_background(self, nbytes):
-        """Pin the host memory in the background (pinning ~2 GB takes seconds)."""
+        """Pin the host memory in the background (pinning a few GB takes seconds)."""
         if self._reserving is None and torch.cuda.is_available():
             self._reserving = threading.Thread(target=self._reserve_quietly, args=(nbytes,),
                                                name="offload-pinning", daemon=True)
@@ -69,7 +97,9 @@ class Offloader:
             self._reserving = None
         if self.stream is not None:
             self.stream.synchronize()
-        self.entries, self.in_flight, self.cursor = [], [], 0
+        self.peak_cursor = max(self.peak_cursor, self.cursor)
+        self.entries, self.groups, self.in_flight, self.cursor = [], {}, [], 0
+        self.in_flight_bytes, self.layer, self.seen = 0, None, {}
         if nbytes:
             self._reserve_quietly(nbytes)  # if pinning fails, the step runs without offloading
         self.armed = self.arena is not None
@@ -85,30 +115,39 @@ class Offloader:
         self.cursor = start + nbytes
         return self.arena[start:start + nbytes]
 
-    def save(self, gate, up):
+    def save(self, *tensors):
+        """Start copying dense GPU tensors to the arena; returns their entry for `load`."""
         entry = _Entry()
-        entry.index, entry.device = len(self.entries), gate.device
-        entry.shape, entry.dtype = gate.shape, gate.dtype
-        entry.gpu, entry.host, entry.copied, entry.back, entry.fetched = (gate, up), None, None, \
+        entry.index, entry.device = len(self.entries), tensors[0].device
+        entry.group = self.layer if self.layer is not None else entry.index
+        entry.specs = tuple((t.shape, t.stride(), t.dtype) for t in tensors)
+        entry.gpu, entry.host, entry.copied, entry.back, entry.fetched = tensors, None, None, \
             None, None
+        entry.nbytes = sum(t.numel() * t.element_size() for t in tensors)
         self.entries.append(entry)
-        nbytes = gate.numel() * gate.element_size()
-        host = self._host(2 * nbytes)
-        if host is None:  # no room left: this pair simply stays on the GPU
+        self.groups.setdefault(entry.group, []).append(entry)
+        host = self._host(entry.nbytes + ALIGN * len(tensors))
+        if host is None:  # no room left: these simply stay on the GPU
+            self.kept_on_gpu += 1
             return entry
         if self.stream is None:
-            self.stream = torch.cuda.Stream(device=gate.device)
+            self.stream = torch.cuda.Stream(device=entry.device)
         ready = torch.cuda.Event()
-        ready.record(torch.cuda.current_stream(gate.device))
+        ready.record(torch.cuda.current_stream(entry.device))
+        views, offset = [], 0
+        for t in tensors:
+            n = t.numel() * t.element_size()
+            views.append(host[offset:offset + n].view(t.dtype).as_strided(t.shape, t.stride()))
+            offset += -(-n // ALIGN) * ALIGN
         with torch.cuda.stream(self.stream):
-            self.stream.wait_event(ready)  # gate and up are computed
-            entry.host = (host[:nbytes].view(gate.dtype).view(gate.shape),
-                          host[nbytes:].view(up.dtype).view(up.shape))
-            entry.host[0].copy_(gate, non_blocking=True)
-            entry.host[1].copy_(up, non_blocking=True)
+            self.stream.wait_event(ready)  # the tensors are computed
+            for view, t in zip(views, tensors):
+                view.copy_(t, non_blocking=True)
             entry.copied = torch.cuda.Event()
             entry.copied.record(self.stream)
+        entry.host = tuple(views)
         self.in_flight.append(entry)
+        self.in_flight_bytes += entry.nbytes
         self._retire()
         return entry
 
@@ -119,72 +158,152 @@ class Offloader:
         for entry in self.in_flight:
             if entry.copied.query():
                 entry.gpu = None
+                self.in_flight_bytes -= entry.nbytes
             else:
                 waiting.append(entry)
-        while len(waiting) > MAX_IN_FLIGHT:
+        while waiting and self.in_flight_bytes > MAX_IN_FLIGHT_BYTES:
             entry = waiting.pop(0)
             entry.copied.synchronize()
             entry.gpu = None
+            self.in_flight_bytes -= entry.nbytes
         self.in_flight = waiting
 
     def release_all(self):
         """Wait for the transfers still in flight and drop their GPU tensors. Called before the
-        head, whose logits chunk would otherwise sit next to the last layers' pairs."""
+        head, whose logits chunk would otherwise sit next to the last layers' tensors."""
         for entry in self.in_flight:
             entry.copied.synchronize()
             entry.gpu = None
-        self.in_flight = []
+        self.in_flight, self.in_flight_bytes = [], 0
+
+    def _fetch_group(self, group):
+        for entry in self.groups.get(group, ()):
+            if entry.gpu is None and entry.back is None and entry.host is not None:
+                self._fetch(entry)
 
     def prefetch_last(self):
-        """Start copying the last pair back: it is the first one the backward pass needs."""
+        """Start copying the last group back: it is the first one the backward pass needs."""
         if self.entries:
-            last = self.entries[-1]
-            if last.gpu is None and last.back is None and last.host is not None:
-                self._fetch(last)
+            self._fetch_group(self.entries[-1].group)
 
     def _fetch(self, entry):
-        """Copy a pair back to the GPU on the copy stream. The buffers are allocated in the
+        """Copy an entry back to the GPU on the copy stream. The buffers are allocated in the
         compute stream's order, and the copy starts after the compute work queued so far."""
         compute = torch.cuda.current_stream(entry.device)
-        gate = torch.empty(entry.shape, dtype=entry.dtype, device=entry.device)
-        up = torch.empty(entry.shape, dtype=entry.dtype, device=entry.device)
+        back = tuple(torch.empty_strided(shape, stride, dtype=dtype, device=entry.device)
+                     for shape, stride, dtype in entry.specs)
         ready = torch.cuda.Event()
         ready.record(compute)
         with torch.cuda.stream(self.stream):
             self.stream.wait_event(ready)
-            gate.copy_(entry.host[0], non_blocking=True)
-            up.copy_(entry.host[1], non_blocking=True)
+            for gpu, host in zip(back, entry.host):
+                gpu.copy_(host, non_blocking=True)
             entry.fetched = torch.cuda.Event()
             entry.fetched.record(self.stream)
-        entry.back = (gate, up)
+        entry.back = back
 
     def load(self, entry):
-        """gate and up for the backward pass; starts fetching the previous layer's pair."""
+        """The entry's tensors for the backward pass; the rest of its group is fetched with it,
+        and the previous group starts coming back while this one is used."""
         if entry.gpu is not None:
-            pair = entry.gpu
+            tensors = entry.gpu
         else:
             if entry.back is None:
-                self._fetch(entry)
+                if entry.group is not None:
+                    self._fetch_group(entry.group)
+                if entry.back is None:  # not in a group
+                    self._fetch(entry)
             torch.cuda.current_stream(entry.device).wait_event(entry.fetched)
-            pair = entry.back
+            tensors = entry.back
         entry.gpu = entry.back = None
-        if entry.index > 0:
-            previous = self.entries[entry.index - 1]
-            if previous.gpu is None and previous.back is None and previous.host is not None:
-                self._fetch(previous)
-        return pair
+        if entry.host is None:  # it stayed on the GPU: a second load needs it again
+            entry.gpu = tensors
+        if entry.group is not None:
+            self._fetch_group(entry.group - 1)
+        return tensors
+
+    # saved_tensors_hooks for everything else a decoder layer keeps for its backward pass
+
+    def pack(self, tensor):
+        seen = self.seen.get(id(tensor))
+        if seen is not None and seen[0]() is tensor:  # the same tensor saved again (RoPE's
+            entry = seen[1]                           # cos/sin, by every layer): copied once
+            if entry.group is not None and entry.group != self.layer:
+                # shared across layers: fetched on its own when needed, never with a group
+                self.groups[entry.group].remove(entry)
+                entry.group = None
+            return entry
+        if (not self.armed or not tensor.is_cuda or isinstance(tensor, torch.nn.Parameter)
+                or tensor.dtype == torch.uint8
+                or tensor.numel() * tensor.element_size() < SAVED_MIN_BYTES
+                or not _dense(tensor)):
+            return tensor
+        entry = self.save(tensor)
+        # a weak reference: the check above matches only this very tensor object, never a new
+        # tensor that happens to get the same id or address after this one is freed
+        self.seen[id(tensor)] = (weakref.ref(tensor), entry)
+        return entry
+
+    def unpack(self, packed):
+        if isinstance(packed, torch.Tensor):
+            return packed
+        return self.load(packed)[0]  # a second unpack fetches the host copy again
 
 
 OFFLOADER = Offloader()
 
 
 def arena_bytes(config, max_tokens):
-    """Host memory for one step: gate and up (fp16) of every layer for max_tokens tokens."""
+    """Host memory for one step, for max_tokens tokens: gate and up (fp16) of every layer, and
+    an estimate of what else a layer saves (two fp32 norm inputs, fp16 LoRA inputs, q/k/v and
+    the attention output, dropout masks: about 22 x hidden bytes per token)."""
     layers = getattr(config, "num_hidden_layers", 0)
     inter = getattr(config, "intermediate_size", 0)
+    hidden = getattr(config, "hidden_size", 0) or 0
     if not layers or not inter or not max_tokens:
         return 0
-    return layers * (2 * max_tokens * inter * 2 + 2 * ALIGN)
+    return layers * (max_tokens * (2 * inter * 2 + SAVED_PER_HIDDEN * hidden) + 32 * ALIGN)
+
+
+def _report():
+    if OFFLOADER.peak_cursor or OFFLOADER.cursor:
+        import sys
+
+        arena = OFFLOADER.arena.numel() if OFFLOADER.arena is not None else 0
+        print(f"[solution] offload: peak host use {max(OFFLOADER.peak_cursor, OFFLOADER.cursor) >> 20}"
+              f" MiB of {arena >> 20} MiB, entries kept on GPU {OFFLOADER.kept_on_gpu}",
+              file=sys.stderr)
+
+
+atexit.register(_report)
+
+
+def patch_qwen2_layer_offload():
+    """Everything a decoder layer saves for its backward pass (above SAVED_MIN_BYTES) goes to
+    the host arena too, through autograd's saved-tensor hooks, grouped by layer so the backward
+    pass fetches layer i - 1 while layer i runs. Exact copies: the numbers do not change."""
+    from transformers.models.qwen2 import modeling_qwen2
+
+    cls = modeling_qwen2.Qwen2DecoderLayer
+    if getattr(cls.forward, "_kc_offload", False):
+        return
+    original = cls.forward
+
+    def forward(self, *args, **kwargs):
+        if not (OFFLOADER.armed and self.training and torch.is_grad_enabled()
+                and torch._C._current_graph_task_id() == -1):
+            return original(self, *args, **kwargs)
+        previous = OFFLOADER.layer
+        OFFLOADER.layer = getattr(self.self_attn, "layer_idx", None)
+        try:
+            with torch.autograd.graph.saved_tensors_hooks(OFFLOADER.pack, OFFLOADER.unpack):
+                return original(self, *args, **kwargs)
+        finally:
+            OFFLOADER.layer = previous
+
+    forward._kc_offload = True
+    forward._kc_patched = True
+    cls.forward = forward
 
 
 class OffloadedSwiGLU(torch.autograd.Function):
