@@ -7,15 +7,17 @@ LoRA, оптимизатор и расписание не меняются.
 
 | Компонент | Файл / кернел | Что реализовано |
 |---|---|---|
-| Head и CE | fused_ce.py / lm_head_ce_kernel | Logits частями до 512 строк; online log-sum-exp, loss, entropy, argmax и градиент logits в одном кернеле |
-| Интеграция | head_patch.py | Метрики TRL и token loss для rewind; замороженный tied embedding/head хранится fp16, embedding output возвращается fp32 |
+| Head и CE в int8 | head8.py / int8_rows_dequant_kernel, head_partial_kernel, head_grad_kernel | Tied embedding/lm_head (151936 × 1536) хранится как int8 по строкам + fp32-масштаб (233 вместо 467 МБ; **единственное приближение в решении**, вес сдвигается не больше чем на полшага квантования). Голова считается по кускам словаря 8192 строки: проход 1 — logits куска и частичные статистики (max, Σexp, Σexp·x, argmax, logit метки) на строку, слияние в log-sum-exp, loss, entropy, argmax; проход 2 — только строки с меткой: градиент `coef·(softmax − onehot)` в fp16 и его произведение с куском в fp32-сумму. Полная fp16-копия веса и полные logits не создаются |
+| Head и CE (fp16, запасной путь) | fused_ce.py / lm_head_ce_kernel | Logits частями по 256 строк; online log-sum-exp, loss, entropy, argmax и градиент logits в одном кернеле. Используется, если вес нельзя держать в int8 |
+| Интеграция | head_patch.py | Метрики TRL и token loss для rewind; tied embedding не проходит через fp32-апкаст peft (`prepare_model_for_kbit_training`: его fp32-копия рядом с fp16 давала пик при загрузке) |
 | RMSNorm | rmsnorm.py / rms_norm_fwd_kernel, rms_norm_bwd_kernel | Слитые forward/backward по строкам, сохранение входа и inverse RMS |
 | RoPE | rope.py / rope_rotate_kernel | Split-half rotation q/k и транспонированное преобразование градиента, чтение strided входов без предварительной contiguous-копии |
 | NF4 | nf4.py / nf4_dequant_kernel | Double-quantized scale и распаковка NF4 в один запуск, отдельный matmul PyTorch/cuBLAS; поддержан замороженный bias |
 | Add + RMSNorm | add_rmsnorm.py / add_rmsnorm_fwd_kernel, add_rmsnorm_bwd_kernel | Residual add и post-attention RMSNorm одним запуском в каждую сторону; сохраняются только s и inverse RMS |
 | MLP fp16 | mlp.py | Gate/up и SwiGLU на fp16-пути, сокращение сохранённых активаций; residual остаётся fp32 |
 | Удаление паддинга | unpad.py | ~43 % позиций батча — паддинг. Слои работают только с реальными токенами ([1, n, hidden]); attention считается отдельным causal-вызовом SDPA на каждую строку по её реальной длине (строки идут подряд, q/k/v строки — срез, маска не нужна), RoPE берёт cos/sin по позиции каждого токена; dropout LoRA берёт маску для формы с паддингом, так что маски и RNG те же. Совпадает с обучением с паддингом до ~1e-5 на CPU-проверке |
-| Offload активаций MLP | offload.py | gate/up каждого слоя (самые большие сохраняемые тензоры, ~1 МБ на токен) сразу после SwiGLU копируются во второй CUDA-поток в pinned-память хоста и освобождаются на GPU; в backward подгружаются на слой раньше, параллельно со счётом. Копии точные. ~2 ГБ pinned-памяти закрепляются в фоне во время загрузки модели |
+| Offload активаций | offload.py | Всё, что каждый decoder-слой сохраняет для backward (gate/up MLP, входы нормализаций, входы и маски LoRA, q/k/v и выход attention), копируется во втором CUDA-потоке в pinned-память хоста: gate/up сразу после SwiGLU, остальное — через `torch.autograd.graph.saved_tensors_hooks` (механизм `save_on_cpu`, но со своей ареной, одной пачкой копий и одним событием на слой). GPU-тензоры освобождаются сразу после постановки копии (`record_stream`), CPU копий не ждёт. В backward слой i−1 подгружается, пока считается слой i. Копии точные. Арена ~4 ГБ закрепляется в фоне во время загрузки модели |
+| Веса NF4 в памяти хоста | wstream.py | Упакованные 4-битные веса всех 196 проекций (~650 МБ) уходят в pinned-память хоста прямо при загрузке модели (сразу после квантования каждого слоя bitsandbytes); перед matmul вес приходит на GPU по второму потоку окном на 8 проекций вперёд (в backward — назад). Таблицы масштабов (~20 МБ) остаются на GPU; байты те же |
 | Подготовка датасета | startup.py | Soup токенизирует строки через `datasets.map`, а `datasets` перед этим хеширует функцию с токенизатором через dill (~2 с); передаём отпечаток, посчитанный по строкам и настройкам: те же строки, 2,9 → 0,75 с |
 | Компиляция в фоне | warmup.py | apply() запускает каждый кернел один раз на маленьких тензорах в фоновом потоке, пока Soup загружает модель; компиляция с пустого кэша остаётся внутри замера, но не задерживает первые шаги |
 | SwiGLU | swiglu.py | Пример организаторов; не заявляется собственным кернелом |
@@ -35,6 +37,10 @@ RoPE также отключает FMA и сохраняет промежуто�
 - RMSNorm: Zhang & Sennrich, https://arxiv.org/abs/1910.07467.
 - RoPE: Su et al., RoFormer, https://arxiv.org/abs/2104.09864; split-half layout Qwen2 в transformers 5.16.1.
 - NF4 / double quantization: Dettmers et al., QLoRA, https://arxiv.org/abs/2305.14314; формат bitsandbytes, https://github.com/bitsandbytes-foundation/bitsandbytes.
+- int8 по строкам с absmax-масштабом: Dettmers et al., LLM.int8(), https://arxiv.org/abs/2208.07339.
+- Offload активаций через saved-tensor hooks: `torch.autograd.graph.save_on_cpu`, https://pytorch.org/docs/stable/autograd.html#saved-tensors-hooks;
+  offload весов по слоям — идея ZeRO-Offload / ZeRO-Infinity (Ren et al., https://arxiv.org/abs/2101.06840), реализация своя.
+- Слияние частичных softmax-статистик по кускам словаря: FlashAttention (Dao et al., https://arxiv.org/abs/2205.14135).
 - Online softmax: Milakov & Gimelshein, https://arxiv.org/abs/1805.02867.
 - Chunked head/loss: Soup stream_loss_chunk (#1693 в комментариях), https://github.com/MakazhanAlpamys/Soup;
   идея fused linear CE из https://github.com/linkedin/Liger-Kernel, без подключения библиотеки.
