@@ -34,7 +34,11 @@ class WeightStreamer:
         self.index = {}  # host data_ptr -> position
         self.units = []  # copy units, in forward order
         self.unit_of = {}  # position -> (unit number, offset, nbytes, shape)
-        self.ready = {}  # unit number -> [GPU buffer, event, waited, uses left, fp16 weights]
+        self.ready = {}  # unit number -> [GPU bytes, event, waited, uses left, fp16 weights,
+        #                  the kept buffer the bytes are in]
+        self.spare = []  # kept GPU buffers for packed units, free for the next copy
+        self.unit_out = None  # kept GPU buffer that a unit is dequantized into
+        self.unit_owner = None  # the unit whose fp16 weights unit_out holds
         self.states = []  # quant state of each position
         self.metas = {}  # unit number -> nf4.UnitMeta (one dequantization launch per layer)
         self.stream = None
@@ -131,19 +135,30 @@ class WeightStreamer:
 
     def new_step(self):
         """Before each training forward: the first layer's weights start coming over."""
+        for entry in self.ready.values():  # (units a pass did not use up: their buffers return)
+            self._give_back(entry)
         self.ready = {}
         self._ensure_units()
         if self.host:
             self.compute = torch.cuda.current_stream()
-            for number in range(AHEAD + 1):
-                self._fetch(number)
+            self._fetch(0)
+            self._fetch_ahead(0, 1)
+
+    def _fetch_ahead(self, number, step):
+        """Start copying the units after `number` in the pass's direction. A unit dequantized
+        whole (one launch) asks for them only after its launch, so the next unit's bytes go into
+        the buffer this one's have just left: one packed buffer serves the whole run."""
+        if number not in self.metas or self.ready.get(number, [None] * 5)[4] is not None:
+            for ahead in range(1, AHEAD + 1):
+                self._fetch(number + step * ahead)
 
     def _fetch(self, number):
         if not 0 <= number < len(self.units) or number in self.ready:
             return
         compute = self.compute if self.compute is not None else torch.cuda.current_stream()
         unit = self.units[number]
-        gpu = torch.empty(unit.region.shape, dtype=torch.uint8, device=compute.device)
+        kept = self._buffer(unit.region.numel(), compute.device)
+        gpu = kept[:unit.region.numel()]
         queued = torch.cuda.Event()
         queued.record(compute)  # the buffer may reuse memory the queued compute still reads
         done = torch.cuda.Event()
@@ -151,12 +166,42 @@ class WeightStreamer:
             self.stream.wait_event(queued)
             gpu.copy_(unit.region, non_blocking=True)
             done.record(self.stream)
-        self.ready[number] = [gpu, done, False, len(unit.members), None]
+        self.ready[number] = [gpu, done, False, len(unit.members), None, kept]
+
+    def _buffer(self, nbytes, device):
+        """A GPU buffer for a unit's packed bytes. The same two or three buffers serve the whole
+        run (each the size of the largest unit): allocated and freed per layer between the
+        activations, these big blocks left holes, and the allocator held ~120 MiB more than it
+        ever had allocated."""
+        for i, buffer in enumerate(self.spare):
+            if buffer.numel() >= nbytes and buffer.device == device:
+                return self.spare.pop(i)
+        largest = max([unit.region.numel() for unit in self.units] + [nbytes])
+        return torch.empty(largest, dtype=torch.uint8, device=device)
+
+    def _give_back(self, entry):
+        """The unit's packed bytes are not needed any more (the kernels reading them are queued
+        on the compute stream; the next copy into the buffer waits for that stream)."""
+        if entry[5] is not None:
+            self.spare.append(entry[5])
+            entry[5] = None
+
+    def _unit_out(self, meta, device):
+        """The kept buffer a unit is dequantized into: one unit's fp16 weights at a time, the
+        next unit's launch queued on the same stream after the matmuls that read the last."""
+        needed = 2 * meta.n_bytes
+        if self.unit_out is None or self.unit_out.numel() < needed or \
+                self.unit_out.device != device:
+            self.unit_out = None
+            largest = max([2 * m.n_bytes for m in self.metas.values()] + [needed])
+            self.unit_out = torch.empty(largest, dtype=torch.float16, device=device)
+        return self.unit_out[:needed]
 
     def prefetch_backward(self):
         """Before the backward pass: its first weights are the last layer's."""
-        for number in range(len(self.units) - 1, len(self.units) - 2 - AHEAD, -1):
-            self._fetch(number)
+        last = len(self.units) - 1
+        self._fetch(last)
+        self._fetch_ahead(last, -1)
 
     def get(self, packed):
         """The GPU copy of a packed weight (the tensor itself when it is not streamed)."""
@@ -169,8 +214,7 @@ class WeightStreamer:
         number, offset, nbytes, shape = self.unit_of[position]
         step = 1 if torch._C._current_graph_task_id() == -1 else -1  # forward or backward
         self._fetch(number)
-        for ahead in range(1, AHEAD + 1):
-            self._fetch(number + step * ahead)
+        self._fetch_ahead(number, step)
         entry = self.ready[number]
         if entry[0] is None:  # already dequantized for this pass by weight(): fetch it again
             del self.ready[number]
@@ -178,9 +222,11 @@ class WeightStreamer:
             entry = self.ready[number]
         self._wait(entry)
         entry[3] -= 1
-        if entry[3] <= 0:  # every weight of the unit taken: its buffer goes with the last view
+        packed = entry[0][offset:offset + nbytes].view(shape)
+        if entry[3] <= 0:  # every weight of the unit taken: its buffer goes after the last view
             del self.ready[number]
-        return entry[0][offset:offset + nbytes].view(shape)
+            self._give_back(entry)
+        return packed
 
     def _wait(self, entry):
         if not entry[2]:
@@ -204,13 +250,19 @@ class WeightStreamer:
             return dequantize_nf4(self.get(packed), quant_state, dtype)
         step = 1 if torch._C._current_graph_task_id() == -1 else -1  # forward or backward
         self._fetch(number)
-        for ahead in range(1, AHEAD + 1):
-            self._fetch(number + step * ahead)
         entry = self.ready[number]
+        if entry[4] is not None and self.unit_owner != number:  # overwritten by another unit
+            del self.ready[number]
+            self._give_back(entry)
+            self._fetch(number)
+            entry = self.ready[number]
         if entry[4] is None:
             self._wait(entry)
-            entry[4] = dequantize_unit(entry[0], meta)
+            entry[4] = dequantize_unit(entry[0], meta, self._unit_out(meta, entry[0].device))
+            self.unit_owner = number
             entry[0] = None  # the packed copy is not needed any more
+            self._give_back(entry)
+        self._fetch_ahead(number, step)  # into the buffer just given back
         weights = entry[4]
         entry[3] -= 1
         if entry[3] <= 0:

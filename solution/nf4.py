@@ -153,10 +153,12 @@ class UnitMeta:
         return all(starts[i] + sizes[i] == starts[i + 1] for i in range(len(starts) - 1))
 
 
-def dequantize_unit(packed, meta):
+def dequantize_unit(packed, meta, out=None):
     """fp16 weights of a whole layer from its packed bytes (one GPU buffer) in one launch: the
-    weight at byte offset o with n elements is out[2 * o: 2 * o + n]."""
-    out = torch.empty(2 * meta.n_bytes, dtype=torch.float16, device=packed.device)
+    weight at byte offset o with n elements is out[2 * o: 2 * o + n]. `out`: a contiguous fp16
+    buffer of 2 * meta.n_bytes elements to write into (one the caller keeps), else a new one."""
+    if out is None:
+        out = torch.empty(2 * meta.n_bytes, dtype=torch.float16, device=packed.device)
     programs = meta.member.numel()
     nf4_unit_dequant_kernel[(programs,)](
         packed.reshape(-1), meta.member, meta.start, meta.a8_base, meta.a2_base, meta.offsets,
