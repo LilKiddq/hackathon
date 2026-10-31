@@ -100,15 +100,21 @@ class Offloader:
             atexit.register(self._reserving.join, 120)
 
     def _reserve_quietly(self, nbytes):
+        from .diagtime import mark  # DIAG
         try:
+            mark(f"pin begin {nbytes >> 20} MiB")
             self.reserve(nbytes)
+            mark("pin end")
         except Exception:  # noqa: BLE001 - without the arena the step reserves it, or keeps all on GPU
             self.arena = None
 
     def new_step(self, nbytes=None):
         """Called before each training forward; the previous step's backward has finished."""
         if self._reserving is not None:
+            from .diagtime import mark  # DIAG
+            mark("pin join begin")
             self._reserving.join()
+            mark("pin join end")
             self._reserving = None
         if self.stream is not None:
             self.stream.synchronize()

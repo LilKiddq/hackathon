@@ -86,8 +86,11 @@ def _compile_all():
 
 def _run():
     # on the default stream: a stream of its own would get its own cuBLAS workspace (+44 MiB peak)
+    from .diagtime import mark  # DIAG
+    mark("warmup start")
     try:
         _compile_all()
+        mark("warmup end")
     except Exception:  # noqa: BLE001 - a failed warm-up only means the kernels compile later
         pass
 
@@ -106,7 +109,10 @@ def start():
 def wait():
     global _thread
     if _thread is not None:
+        from .diagtime import mark  # DIAG
+        mark("warmup wait begin")
         _thread.join(TIMEOUT_S)
+        mark("warmup wait end")
         _thread = None
         # the warm-up's small blocks would otherwise stay cached next to the training's (~18 MiB)
         torch.cuda.empty_cache()

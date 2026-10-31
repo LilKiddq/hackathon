@@ -151,6 +151,8 @@ def patch_sft_trainer():
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)
 
+        from .diagtime import mark  # DIAG
+        mark("compute_loss enter")
         warmup.wait()  # the background compilation (warmup.py) is done before the first step
         max_tokens = (getattr(self.args, "per_device_train_batch_size", 0) or 0) * \
             (getattr(self.args, "max_length", 0) or 0) or inputs["input_ids"].numel()
@@ -159,6 +161,7 @@ def patch_sft_trainer():
         offload.OFFLOADER.resident_from = layers - offload.RESIDENT_LAYERS
         STREAMER.install(lm, offload.RESIDENT_LAYERS)  # once: 4-bit weights to the host
         STREAMER.new_step()
+        mark("step prepared")
         mode = "train"
         inputs.pop("_prediction_loss_only", None)  # as TRL does before it delegates
         inputs["use_cache"] = False
@@ -338,6 +341,8 @@ def patch_soup_setup():
     original = cls._setup_transformers
 
     def _setup_transformers(self, *args, **kwargs):
+        from .diagtime import mark  # DIAG
+        mark("setup start")
         _start_pinning(*args)
         try:
             patch_kbit_preparation()  # peft is imported here anyway, right before it is used
@@ -345,12 +350,14 @@ def patch_soup_setup():
             pass
         with weights_to_host_while_loading() as hosted:
             result = original(self, *args, **kwargs)
+        mark("setup original done")
         model = getattr(self, "model", None)
         if isinstance(model, torch.nn.Module):
             if hosted and _causal_lm(model) is not None:
                 trainable_to_gpu(model)
             _fp16_tied_embedding(model)
             _int8_tied_embedding(model)
+        mark("setup end")
         return result
 
     _setup_transformers._kc_patched = True
