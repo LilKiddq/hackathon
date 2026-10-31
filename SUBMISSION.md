@@ -1,4 +1,6 @@
-# Submission: Kuchbrtna
+# Submission: Lean Soup (команда Kuchbrtna)
+
+- Project: **Lean Soup — дообучение Qwen2.5-1.5B на 735 МБ видеопамяти вместо 14,3 ГБ, в 1,5 раза быстрее**
 
 ## Links
 
