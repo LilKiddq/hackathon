@@ -11,7 +11,7 @@ LoRA, оптимизатор и расписание не меняются.
 | Интеграция | head_patch.py | Метрики TRL и token loss для rewind; замороженный tied embedding/head хранится fp16, embedding output возвращается fp32 |
 | RMSNorm | rmsnorm.py / rms_norm_fwd_kernel, rms_norm_bwd_kernel | Слитые forward/backward по строкам, сохранение входа и inverse RMS |
 | RoPE | rope.py / rope_rotate_kernel | Split-half rotation q/k и транспонированное преобразование градиента, чтение strided входов без предварительной contiguous-копии |
-| NF4 | nf4.py / nf4_dequant_kernel | Double-quantized scale и распаковка NF4 в один запуск, отдельный matmul PyTorch/cuBLAS; поддержан замороженный bias |
+| NF4 | nf4.py / nf4_unit_dequant_kernel (запасной: nf4_dequant_kernel) | Double-quantized scale и распаковка NF4 всего слоя в один запуск, отдельный matmul PyTorch/cuBLAS; поддержан замороженный bias |
 | Add + RMSNorm | add_rmsnorm.py / add_rmsnorm_fwd_kernel, add_rmsnorm_bwd_kernel | Residual add и post-attention RMSNorm одним запуском в каждую сторону; сохраняются только s и inverse RMS |
 | MLP fp16 | mlp.py | Gate/up и SwiGLU на fp16-пути, сокращение сохранённых активаций; residual остаётся fp32 |
 | Удаление паддинга | unpad.py | ~43 % позиций батча — паддинг. Слои работают только с реальными токенами ([1, n, hidden]); attention считается отдельным causal-вызовом SDPA на каждую строку по её реальной длине (строки идут подряд, q/k/v строки — срез, маска не нужна), RoPE берёт cos/sin по позиции каждого токена; dropout LoRA берёт маску для формы с паддингом, так что маски и RNG те же |
