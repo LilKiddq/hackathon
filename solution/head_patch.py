@@ -39,6 +39,28 @@ def _fp16_weight(module):
     return cached[1]
 
 
+_PEAKS = {}  # DIAG
+
+
+def _phase(name):  # DIAG: peak allocated since the previous phase mark
+    peak = torch.cuda.max_memory_allocated() >> 20
+    now = torch.cuda.memory_allocated() >> 20
+    best = _PEAKS.get(name, (0, 0))
+    if peak > best[0]:
+        _PEAKS[name] = (peak, now)
+    torch.cuda.reset_peak_memory_stats()
+
+
+def _report_peaks():  # DIAG
+    import sys
+    print("[peaks] " + " | ".join(f"{k}: peak {v[0]} MiB (after {v[1]})" for k, v in _PEAKS.items()),
+          file=sys.stderr)
+
+
+import atexit  # noqa: E402  DIAG
+atexit.register(_report_peaks)
+
+
 def _fused_forward(self, original, input_ids=None, attention_mask=None, position_ids=None,
                    past_key_values=None, inputs_embeds=None, labels=None, use_cache=None,
                    logits_to_keep=0, **kwargs):
@@ -68,6 +90,7 @@ def _fused_forward(self, original, input_ids=None, attention_mask=None, position
     else:
         denominator = torch.tensor(num_items_in_batch, device=hidden.device)
 
+    _phase("forward")  # DIAG
     offload.OFFLOADER.release_all()  # the last layers' MLP pairs leave the GPU before the head
     int8 = getattr(self, "_kc_int8", None)
     if int8 is not None:  # the tied weight held as int8 rows (head8.py)
@@ -80,6 +103,7 @@ def _fused_forward(self, original, input_ids=None, attention_mask=None, position
             flat_target.index_select(0, rows), denominator.float())
     offload.OFFLOADER.prefetch_last()  # and the last one comes back while the backward starts
     STREAMER.prefetch_backward()  # as do the last layer's weights
+    _phase("head")  # DIAG
 
     def scatter(values, dtype):
         full = torch.zeros(batch * seq, device=hidden.device, dtype=dtype)
@@ -151,6 +175,7 @@ def patch_sft_trainer():
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)
 
+        _phase("backward+optimizer+between")  # DIAG
         warmup.wait()  # the background compilation (warmup.py) is done before the first step
         max_tokens = (getattr(self.args, "per_device_train_batch_size", 0) or 0) * \
             (getattr(self.args, "max_length", 0) or 0) or inputs["input_ids"].numel()
@@ -351,6 +376,7 @@ def patch_soup_setup():
                 trainable_to_gpu(model)
             _fp16_tied_embedding(model)
             _int8_tied_embedding(model)
+        _phase("setup")  # DIAG
         return result
 
     _setup_transformers._kc_patched = True
