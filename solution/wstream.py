@@ -12,7 +12,8 @@ The dequantization reads exactly the same bytes, so the numbers do not change.
 
 import torch
 
-AHEAD = 8  # projections fetched ahead of the one in use (~one decoder layer, ~25 MB)
+import os
+AHEAD = int(os.environ.get('KC_AHEAD', '8'))  # projections fetched ahead of the one in use (~one decoder layer, ~25 MB)
 
 
 class WeightStreamer:
@@ -25,7 +26,7 @@ class WeightStreamer:
 
     def install(self, model):
         """Move the packed weights of every 4-bit projection in the decoder layers to the host."""
-        if self.installed:
+        if self.installed or os.environ.get("KC_NO_WSTREAM"):
             return
         self.installed = True
         from .nf4 import supported

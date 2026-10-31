@@ -29,7 +29,8 @@ import triton
 
 from .swiglu import BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 
-MAX_IN_FLIGHT_BYTES = 256 << 20  # transfers the CPU lets run ahead before it waits for the oldest
+import os as _os
+MAX_IN_FLIGHT_BYTES = int(_os.environ.get('KC_INFLIGHT_MB', '256')) << 20  # transfers the CPU lets run ahead before it waits for the oldest
 SAVED_MIN_BYTES = 256 << 10  # smaller saved tensors stay on the GPU (not worth a transfer)
 SAVED_PER_HIDDEN = 24  # arena estimate: bytes per token and hidden unit a layer saves
 ALIGN = 512
@@ -322,7 +323,10 @@ def _report():
 
         arena = OFFLOADER.arena.numel() if OFFLOADER.arena is not None else 0
         print(f"[solution] offload: peak host use {max(OFFLOADER.peak_cursor, OFFLOADER.cursor) >> 20}"
-              f" MiB of {arena >> 20} MiB, entries kept on GPU {OFFLOADER.kept_on_gpu}",
+              f" MiB of {arena >> 20} MiB, entries kept on GPU {OFFLOADER.kept_on_gpu}"
+              f" | torch peak alloc {torch.cuda.max_memory_allocated() >> 20} MiB"
+              f" reserved {torch.cuda.max_memory_reserved() >> 20} MiB | env "
+              + " ".join(f"{k}={v}" for k, v in _os.environ.items() if k.startswith("KC_")),
               file=sys.stderr)
 
 
@@ -341,7 +345,7 @@ def patch_qwen2_layer_offload():
     original = cls.forward
 
     def forward(self, *args, **kwargs):
-        if not (OFFLOADER.armed and self.training and torch.is_grad_enabled()
+        if _os.environ.get("KC_NO_LAYER_OFFLOAD") or not (OFFLOADER.armed and self.training and torch.is_grad_enabled()
                 and torch._C._current_graph_task_id() == -1):
             return original(self, *args, **kwargs)
         previous = OFFLOADER.layer
