@@ -14,6 +14,7 @@ Two class patches, both looked up at call time:
   Soup itself uses for its chunked loss (#1693), so rewind.jsonl keeps the same rows and values.
 """
 
+import atexit
 import types
 
 import torch
@@ -25,6 +26,34 @@ from .fused_ce import IGNORE_INDEX, fused_lm_head_ce
 from .head8 import Int8Embedding, dequant_rows, fused_int8_head_ce, quantize_rows
 
 STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR, read by rewind
+
+
+_PEAKS = []  # (where, MiB): each point where the allocator's peak had grown since the last one
+_STEP = [0]
+
+
+def _note_peak(where):
+    """Reads the allocator's peak (a host-side counter: no sync, nothing reset)."""
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        peak = torch.cuda.max_memory_allocated() >> 20
+        if not _PEAKS or peak > _PEAKS[-1][1]:
+            _PEAKS.append((where, peak))
+
+
+def _report_peaks():
+    if _PEAKS:
+        import sys
+
+        from .wstream import EMBEDDING_ON_HOST, LOADED_TO_HOST
+
+        print("[solution] allocator peak grew at: "
+              + " | ".join(f"{where} {mib} MiB" for where, mib in _PEAKS[-12:])
+              + f" | loading: {LOADED_TO_HOST[0]} 4-bit weights and "
+              + ("the" if EMBEDDING_ON_HOST[0] else "not the") + " embedding to host",
+              file=sys.stderr)
+
+
+atexit.register(_report_peaks)
 
 
 def _fp16_weight(module):
@@ -68,6 +97,7 @@ def _fused_forward(self, original, input_ids=None, attention_mask=None, position
     else:
         denominator = torch.tensor(num_items_in_batch, device=hidden.device)
 
+    _note_peak(f"step {_STEP[0]} forward")
     offload.OFFLOADER.release_all()  # the last layers' MLP pairs leave the GPU before the head
     int8 = getattr(self, "_kc_int8", None)
     if int8 is not None:  # the tied weight held as int8 rows (head8.py)
@@ -80,6 +110,7 @@ def _fused_forward(self, original, input_ids=None, attention_mask=None, position
             flat_target.index_select(0, rows), denominator.float())
     offload.OFFLOADER.prefetch_last()  # and the last one comes back while the backward starts
     STREAMER.prefetch_backward()  # as do the last layer's weights
+    _note_peak(f"step {_STEP[0]} head")
 
     def scatter(values, dtype):
         full = torch.zeros(batch * seq, device=hidden.device, dtype=dtype)
@@ -151,6 +182,8 @@ def patch_sft_trainer():
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)
 
+        _note_peak(f"step {_STEP[0]} backward/optimizer")
+        _STEP[0] += 1
         warmup.wait()  # the background compilation (warmup.py) is done before the first step
         max_tokens = (getattr(self.args, "per_device_train_batch_size", 0) or 0) * \
             (getattr(self.args, "max_length", 0) or 0) or inputs["input_ids"].numel()
@@ -189,9 +222,16 @@ def patch_sft_trainer():
 
 
 def _tied_embedding(lm):
+    """The tied embedding / lm_head weight: on the GPU, or in host memory when our loading put it
+    there (wstream.weights_to_host_while_loading)."""
+    from .wstream import EMBEDDING_ON_HOST
+
     embed, head = lm.get_input_embeddings(), lm.lm_head
     weight = getattr(embed, "weight", None)
-    if weight is None or weight is not getattr(head, "weight", None) or not weight.is_cuda:
+    if weight is None or weight is not getattr(head, "weight", None):
+        return None
+    if not (weight.is_cuda or (EMBEDDING_ON_HOST[0] and weight.device.type == "cpu"
+                               and torch.cuda.is_available())):
         return None
     return weight
 
@@ -239,9 +279,17 @@ def _int8_tied_embedding(model):
             or weight.dim() != 2:
         return
     embed, head = lm.get_input_embeddings(), lm.lm_head
-    q, scale = quantize_rows(weight.detach())
-    stand_in = torch.nn.Parameter(weight.new_zeros((1, 1)).expand(weight.shape),
-                                  requires_grad=False)
+    # the int8 rows live in pinned host memory (233 MB off the GPU for the whole run): the head
+    # streams them a tile ahead, the embedding gathers its rows on the CPU (head8.py)
+    from .wstream import host_bytes
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    host = host_bytes(weight.numel())
+    q, scale = quantize_rows(weight.detach(), host.view(weight.shape) if host is not None
+                             else None, device=device)
+    stand_in = torch.nn.Parameter(
+        torch.zeros((1, 1), dtype=weight.dtype, device=device).expand(weight.shape),
+        requires_grad=False)
     embed.weight = stand_in
     head.weight = stand_in
     del weight
@@ -250,8 +298,9 @@ def _int8_tied_embedding(model):
     def embed_forward(ids):
         return Int8Embedding.apply(ids, q, scale)
 
-    def head_forward(hidden):
-        return functional.linear(hidden.to(torch.float16), dequant_rows(q, scale))
+    def head_forward(hidden):  # any call besides training's fused step: the full table
+        return functional.linear(hidden.to(torch.float16),
+                                 dequant_rows(q.to(hidden.device), scale))
 
     embed.forward = embed_forward
     head.forward = head_forward
@@ -351,7 +400,39 @@ def patch_soup_setup():
                 trainable_to_gpu(model)
             _fp16_tied_embedding(model)
             _int8_tied_embedding(model)
+            _note_peak("setup")
         return result
 
     _setup_transformers._kc_patched = True
     cls._setup_transformers = _setup_transformers
+
+    # where the allocator's peak grows between setup and the first step (report only)
+    setup = cls.setup
+
+    def setup_with_note(self, *args, **kwargs):
+        result = setup(self, *args, **kwargs)
+        _note_peak("trainer built")
+        return result
+
+    cls.setup = setup_with_note
+    try:
+        import transformers
+
+        trainer_cls = transformers.Trainer
+        if not getattr(trainer_cls.training_step, "_kc_noted", False):
+            training_step = trainer_cls.training_step
+            inner_loop = trainer_cls._inner_training_loop
+
+            def training_step_with_note(self, *args, **kwargs):
+                _note_peak(f"step {_STEP[0] + 1} before compute_loss")
+                return training_step(self, *args, **kwargs)
+
+            def inner_loop_with_note(self, *args, **kwargs):
+                _note_peak("train() start")
+                return inner_loop(self, *args, **kwargs)
+
+            training_step_with_note._kc_noted = True
+            trainer_cls.training_step = training_step_with_note
+            trainer_cls._inner_training_loop = inner_loop_with_note
+    except Exception:  # noqa: BLE001 - only a report
+        pass

@@ -14,8 +14,9 @@ How (training only, when the batch has padding):
   (zeros elsewhere), runs RoPE and attention exactly as before with the same mask, and packs
   the output again for o_proj. Padding keys are masked and padding queries are dropped, as
   before, so real tokens get the same attention.
-- LoRA's dropout draws its mask for the padded shape and then packs it, so every real token
-  gets the same random mask as in the padded run and the generator advances the same way.
+- LoRA's dropout (p = 0.05, unchanged) draws its mask for the packed real tokens only. The
+  masks are other draws of the same distribution than in the padded run (the random stream
+  advances differently); the first step is the same either way, as LoRA's B starts at zero.
 - The model's output is put back in the padded shape, so the head, loss and metrics see the
   same tensor as before (padding rows are zeros there and are skipped by the fused loss).
 """
@@ -75,9 +76,16 @@ def _row_attention(module, hidden_states, position_embeddings, index, seq, rows)
         dtype = torch.get_autocast_dtype("cuda")
         query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
     groups = getattr(module, "num_key_value_groups", 1)
+    attn_output = RowsAttention.apply(query, key, value, tuple(rows), groups, module.scaling)
+    return module.o_proj(attn_output), None
+
+
+def _attend(query, key, value, rows, groups, scale):
+    """Causal SDPA per row on packed q [1, H, n, D] and k/v [1, KV, n, D] -> [1, n, H * D]."""
+    from transformers.models.qwen2 import modeling_qwen2
+
     key = modeling_qwen2.repeat_kv(key, groups)
     value = modeling_qwen2.repeat_kv(value, groups)
-
     outputs, start = [], 0
     for length in rows:
         if length == 0:
@@ -85,10 +93,35 @@ def _row_attention(module, hidden_states, position_embeddings, index, seq, rows)
         stop = start + length
         outputs.append(torch.nn.functional.scaled_dot_product_attention(
             query[:, :, start:stop], key[:, :, start:stop], value[:, :, start:stop],
-            dropout_p=0.0, scale=module.scaling, is_causal=length > 1).transpose(1, 2))
+            dropout_p=0.0, scale=scale, is_causal=length > 1).transpose(1, 2))
         start = stop
-    attn_output = torch.cat(outputs, dim=1).reshape(1, n, -1)
-    return module.o_proj(attn_output), None
+    return torch.cat(outputs, dim=1).reshape(1, query.shape[2], -1)
+
+
+class RowsAttention(torch.autograd.Function):
+    """The per-row attention, keeping for the backward pass only q and the grouped k/v (before
+    they are repeated for the 12 query heads): 4 KB per token instead of q, the repeated k/v and
+    the output (12 KB), a third of the bytes to offload. The backward pass recomputes the
+    attention forward from them (deterministic kernels, the same numbers; a few percent of a
+    layer's work) and differentiates it."""
+
+    @staticmethod
+    def forward(ctx, query, key, value, rows, groups, scale):
+        ctx.save_for_backward(query, key, value)
+        ctx.rows, ctx.groups, ctx.scale = rows, groups, scale
+        return _attend(query, key, value, rows, groups, scale)
+
+    @staticmethod
+    def backward(ctx, grad):
+        query, key, value = ctx.saved_tensors
+        with torch.enable_grad():
+            inputs = tuple(t.detach().requires_grad_(need) for t, need
+                           in zip((query, key, value), ctx.needs_input_grad[:3]))
+            out = _attend(*inputs, ctx.rows, ctx.groups, ctx.scale)
+            wanted = [t for t in inputs if t.requires_grad]
+            grads = iter(torch.autograd.grad(out, wanted, grad)) if wanted else iter(())
+        return tuple(next(grads) if t.requires_grad else None for t in inputs) + \
+            (None, None, None)
 
 
 def patch_qwen2_unpad():
@@ -100,7 +133,6 @@ def patch_qwen2_unpad():
     model_forward = model_cls.forward
     layer_forward = modeling_qwen2.Qwen2DecoderLayer.forward
     attention_forward = modeling_qwen2.Qwen2Attention.forward
-    dropout_forward = torch.nn.Dropout.forward
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
                 past_key_values=None, inputs_embeds=None, use_cache=None, **kwargs):
@@ -182,16 +214,8 @@ def patch_qwen2_unpad():
         attn_output = _pack(attn_output.reshape(batch, seq, -1), index)
         return self.o_proj(attn_output), attn_weights
 
-    def dropout(self, x):
-        # LoRA's dropout on packed tokens: draw the mask for the padded shape, then pack it
-        if self.training and self.p > 0 and _is_packed(x):
-            index, batch, seq = _ctx[:3]
-            return _pack(dropout_forward(self, _unpack(x, index, batch, seq)), index)
-        return dropout_forward(self, x)
-
-    for fn in (forward, decoder_layer, attention, dropout):
+    for fn in (forward, decoder_layer, attention):
         fn._kc_patched = True
     model_cls.forward = forward
     modeling_qwen2.Qwen2DecoderLayer.forward = decoder_layer
     modeling_qwen2.Qwen2Attention.forward = attention
-    torch.nn.Dropout.forward = dropout

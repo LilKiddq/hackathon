@@ -16,8 +16,8 @@ import triton.language as tl
 
 
 @triton.jit
-def rms_norm_fwd_kernel(x_ptr, w_ptr, y_ptr, rstd_ptr, stride, n_cols, eps,
-                        BLOCK: tl.constexpr):
+def rms_norm_fwd_kernel(x_ptr, w_ptr, y_ptr, rstd_ptr, xs_ptr, stride, n_cols, eps,
+                        SAVE_HALF: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     valid = cols < n_cols
@@ -28,6 +28,8 @@ def rms_norm_fwd_kernel(x_ptr, w_ptr, y_ptr, rstd_ptr, stride, n_cols, eps,
     normed = (x * rstd).to(y_ptr.dtype.element_ty).to(tl.float32)
     tl.store(y_ptr + row * stride + cols, (w * normed).to(y_ptr.dtype.element_ty), mask=valid)
     tl.store(rstd_ptr + row, rstd)
+    if SAVE_HALF:  # the copy kept for the backward pass
+        tl.store(xs_ptr + row * n_cols + cols, x.to(tl.float16), mask=valid)
 
 
 @triton.jit
@@ -58,19 +60,25 @@ class RMSNorm(torch.autograd.Function):
         y = torch.empty_like(x2)
         rstd = torch.empty(rows, device=x.device, dtype=torch.float32)
         block = triton.next_power_of_2(cols)
-        rms_norm_fwd_kernel[(rows,)](x2, weight, y, rstd, x2.stride(0), cols, eps, BLOCK=block,
+        # training: the backward pass gets x in fp16 (half the bytes to keep or offload; the
+        # gradient moves by ~1e-3 relative, an approximation the task's tolerances allow)
+        # (grad mode is off inside Function.forward: needs_input_grad says whether x needs one)
+        half = x2.dtype == torch.float32 and ctx.needs_input_grad[0]
+        saved = torch.empty((rows, cols), device=x.device, dtype=torch.float16) if half else x2
+        rms_norm_fwd_kernel[(rows,)](x2, weight, y, rstd, saved, x2.stride(0), cols, eps,
+                                     SAVE_HALF=half, BLOCK=block,
                                      num_warps=8 if block >= 2048 else 4)
-        ctx.save_for_backward(x2, weight, rstd)
-        ctx.block = block
+        ctx.save_for_backward(saved, weight, rstd)
+        ctx.block, ctx.x_dtype = block, x2.dtype
         return y.view(shape)
 
     @staticmethod
     def backward(ctx, dy):
         x2, weight, rstd = ctx.saved_tensors
         rows, cols = x2.shape
-        dy2 = dy.reshape(-1, cols).to(x2.dtype).contiguous()
-        dx = torch.empty_like(x2)
-        rms_norm_bwd_kernel[(rows,)](dy2, x2, weight, rstd, dx, x2.stride(0), cols,
+        dy2 = dy.reshape(-1, cols).to(ctx.x_dtype).contiguous()
+        dx = torch.empty((rows, cols), device=dy.device, dtype=ctx.x_dtype)
+        rms_norm_bwd_kernel[(rows,)](dy2, x2, weight, rstd, dx, cols, cols,
                                      BLOCK=ctx.block, num_warps=8 if ctx.block >= 2048 else 4)
         return dx.view(dy.shape), None, None
 

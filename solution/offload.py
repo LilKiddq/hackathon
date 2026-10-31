@@ -29,7 +29,7 @@ import triton
 
 from .swiglu import BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 
-MAX_IN_FLIGHT_BYTES = 256 << 20  # transfers the CPU lets run ahead before it waits for the oldest
+MAX_IN_FLIGHT_BYTES = 128 << 20  # transfers the CPU lets run ahead before it waits for the oldest
 SAVED_MIN_BYTES = 256 << 10  # smaller saved tensors stay on the GPU (not worth a transfer)
 SAVED_PER_HIDDEN = 24  # arena estimate: bytes per token and hidden unit a layer saves
 ALIGN = 512
