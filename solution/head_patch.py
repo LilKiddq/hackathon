@@ -155,7 +155,9 @@ def patch_sft_trainer():
         max_tokens = (getattr(self.args, "per_device_train_batch_size", 0) or 0) * \
             (getattr(self.args, "max_length", 0) or 0) or inputs["input_ids"].numel()
         offload.OFFLOADER.new_step(offload.arena_bytes(lm.config, max_tokens))
-        STREAMER.install(lm)  # once: the 4-bit weights move to host memory (wstream.py)
+        layers = getattr(lm.config, "num_hidden_layers", 0) or 0
+        offload.OFFLOADER.resident_from = layers - offload.RESIDENT_LAYERS
+        STREAMER.install(lm, offload.RESIDENT_LAYERS)  # once: 4-bit weights to the host
         STREAMER.new_step()
         mode = "train"
         inputs.pop("_prediction_loss_only", None)  # as TRL does before it delegates

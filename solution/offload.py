@@ -29,7 +29,11 @@ import triton
 
 from .swiglu import BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 
-MAX_IN_FLIGHT_BYTES = 256 << 20  # transfers the CPU lets run ahead before it waits for the oldest
+import os as _os
+
+# DIAG: env overrides while tuning (removed before submission)
+RESIDENT_LAYERS = int(_os.environ.get('KC_RESIDENT', '0'))  # last layers kept on the GPU
+MAX_IN_FLIGHT_BYTES = int(_os.environ.get('KC_INFLIGHT_MB', '256')) << 20  # transfers the CPU lets run ahead before it waits for the oldest
 SAVED_MIN_BYTES = 256 << 10  # smaller saved tensors stay on the GPU (not worth a transfer)
 SAVED_PER_HIDDEN = 24  # arena estimate: bytes per token and hidden unit a layer saves
 ALIGN = 512
@@ -72,6 +76,7 @@ class Offloader:
         self.in_flight_bytes = 0
         self.armed = False
         self.layer = None  # the decoder layer whose forward is running (layer_offload)
+        self.resident_from = None  # layers from this index on keep everything on the GPU
         self.seen = {}  # this step's packed tensors, so a tensor saved twice is copied once
         self.pending = []  # the running layer's saved tensors, copied together when it ends
         self.pending_entry = None
@@ -115,8 +120,12 @@ class Offloader:
             self._reserve_quietly(nbytes)  # if pinning fails, the step runs without offloading
         self.armed = self.arena is not None
 
+    def resident(self):
+        return (self.layer is not None and self.resident_from is not None
+                and self.layer >= self.resident_from)
+
     def active(self, gate):
-        return (self.armed and gate.is_cuda and torch.is_grad_enabled()
+        return (self.armed and not self.resident() and gate.is_cuda and torch.is_grad_enabled()
                 and gate.requires_grad and gate.dtype in (torch.float16, torch.bfloat16))
 
     def _host(self, nbytes):
@@ -322,7 +331,10 @@ def _report():
 
         arena = OFFLOADER.arena.numel() if OFFLOADER.arena is not None else 0
         print(f"[solution] offload: peak host use {max(OFFLOADER.peak_cursor, OFFLOADER.cursor) >> 20}"
-              f" MiB of {arena >> 20} MiB, entries kept on GPU {OFFLOADER.kept_on_gpu}",
+              f" MiB of {arena >> 20} MiB, entries kept on GPU {OFFLOADER.kept_on_gpu}"
+              f" | torch peak alloc {torch.cuda.max_memory_allocated() >> 20} MiB"
+              f" reserved {torch.cuda.max_memory_reserved() >> 20} MiB | "
+              + " ".join(f"{k}={v}" for k, v in _os.environ.items() if k.startswith("KC_")),
               file=sys.stderr)
 
 
@@ -346,6 +358,11 @@ def patch_qwen2_layer_offload():
             return original(self, *args, **kwargs)
         previous = OFFLOADER.layer
         OFFLOADER.layer = getattr(self.self_attn, "layer_idx", None)
+        if _os.environ.get("KC_NO_LAYER_OFFLOAD") or OFFLOADER.resident():
+            try:  # the last layers: their backward comes first, nothing to gain from a copy
+                return original(self, *args, **kwargs)
+            finally:
+                OFFLOADER.layer = previous
         try:
             with torch.autograd.graph.saved_tensors_hooks(OFFLOADER.pack, OFFLOADER.unpack):
                 return original(self, *args, **kwargs)

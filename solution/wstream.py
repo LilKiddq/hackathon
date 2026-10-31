@@ -11,6 +11,7 @@ The dequantization reads exactly the same bytes, so the numbers do not change.
 """
 
 import contextlib
+import os
 
 import torch
 
@@ -25,7 +26,7 @@ class WeightStreamer:
         self.stream = None
         self.installed = False
 
-    def install(self, model):
+    def install(self, model, resident_layers=0):
         """Move the packed weights of every 4-bit projection in the decoder layers to the host."""
         if self.installed:
             return
@@ -36,13 +37,20 @@ class WeightStreamer:
             layers = model.model.layers
         except AttributeError:
             return
-        for layer in layers:
+        if os.environ.get("KC_NO_WSTREAM"):
+            resident_layers = len(layers)
+        for number, layer in enumerate(layers):
+            resident = number >= len(layers) - resident_layers
             for module in layer.modules():
                 weight = getattr(module, "weight", None)
                 state = getattr(weight, "quant_state", None)
                 if (type(module).__name__ != "Linear4bit" or weight is None or state is None
                         or weight.dtype != torch.uint8 or not supported(state)
                         or not (weight.is_cuda or weight.is_pinned())):
+                    continue
+                if resident:  # the last layers keep their weights on the GPU
+                    if not weight.is_cuda:
+                        weight.data = weight.data.to(torch.cuda.current_device())
                     continue
                 if weight.is_cuda:
                     host = torch.empty(weight.shape, dtype=weight.dtype, pin_memory=True)
