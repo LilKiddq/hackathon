@@ -15,10 +15,10 @@
 
 | Имя | Роль | GitHub | Kaggle | Контакт капитана |
 |---|---|---|---|---|
-| Nariman Bolatuly | Капитан проекта (тимлид): запуски и замеры на Kaggle, интеграция, сдача | [bayesdz](https://github.com/bayesdz) | [narimanbolatuly](https://www.kaggle.com/narimanbolatuly) | TBD |
+| Nariman Bolatuly | Капитан проекта | [bayesdz](https://github.com/bayesdz) | [narimanbolatuly](https://www.kaggle.com/narimanbolatuly) | — |
 | Aidarov Bakhytzhan | Участник | [LilKiddq](https://github.com/LilKiddq) | [exagee](https://www.kaggle.com/exagee) | — |
 | Abu Sabytbek | Участник | [strogenyakuzo-blip](https://github.com/strogenyakuzo-blip) | — | — |
-| Madiyar Bakhtiyar | Участник; капитан при регистрации на edu.astanahub.com | [Mad1yarBakhtiyar](https://github.com/Mad1yarBakhtiyar) | — | — |
+| Madiyar Bakhtiyar | Участник | [Mad1yarBakhtiyar](https://github.com/Mad1yarBakhtiyar) | [madiyarbakhtiyar](https://www.kaggle.com/madiyarbakhtiyar) | — |
 
 Все прогоны на Kaggle выполнялись с аккаунта narimanbolatuly.
 
@@ -45,7 +45,7 @@ SwiGLU — пример организаторов, не собственный 
 - [x] Финальный коммит вписан (28b3a68).
 - [x] Публичный Kaggle-ноутбук финального прогона добавлен.
 - [x] Название команды и четыре участника заполнены.
-- [x] Роли и профили заполнены; [ ] контакт капитана.
+- [x] Роли и профили заполнены.
 - [ ] Видео и презентация добавлены.
 - [x] Код в репозитории команды от организаторов (BAITC-Hacks/hack-0e0f2cfa-kuchbrtna), история перенесена целиком.
 
